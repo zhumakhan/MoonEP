@@ -588,7 +588,7 @@ def launch_combine(
             ``-raw_dst - 1`` (duplicate top-k entries, pre-reduced into the
             primary slot by the combine prologue): the hidden path skips
             them, the weights gather decodes and reads them as usual.
-        output_sk: [S, K] fp32 buffer to receive gathered route weights, or
+        output_sk: [s, K] fp32 buffer to receive gathered route weights, or
             None to skip the weights gather (placeholder tensor is passed to
             satisfy the non-null pointer constraint; kernel ignores it when
             with_weights=False).

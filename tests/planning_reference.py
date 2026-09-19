@@ -46,7 +46,7 @@ def launch_planning_torch_reference(
     # buffer bound
     N = int(flat_topk_experts.numel())
     assert N % K == 0, f"topk entries {N} not a multiple of K={K}"
-    S = N // k
+    S = N // K
     assert 0 < S <= int(ctx['S']), f"num_tokens {S} outside [1, S={int(ctx['S'])}]"
     CAP = N
     assert CAP <= int(ctx["NvS_capacity"])
@@ -277,10 +277,10 @@ def launch_planning_torch_reference(
 
             groups = {}
             indices = {}
-            for k in range(K):
-                dest = int(dests[k].item())
-                groups.setdefault(dest, []).append(int(loffs[k].item()))
-                indices.setdefault(dest, []).append(k)
+            for kk in range(K):
+                dest = int(dests[kk].item())
+                groups.setdefault(dest, []).append(int(loffs[kk].item()))
+                indices.setdefault(dest, []).append(kk)
 
             for dest, group_loffs in groups.items():
                 dup_count = len(group_loffs) - 1

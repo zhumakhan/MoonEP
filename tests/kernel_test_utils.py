@@ -323,13 +323,18 @@ def assert_ulp_all_ranks(name, actual, expected, rank, R, max_ulps=1):
     )
 
 
-def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
+def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy, num_tokens=None):
     errors = []
     R = int(ctx["R"])
     E = int(ctx["E"])
     B = int(ctx["B"])
     NvS = int(ctx["NvS"])
-    N = case.S * case.K
+    # Meta layout (TOPK0/ORDER/ORDER0/BARRIER/SRC_INFO offsets) is sized by the
+    # Buffer's capacity S, independent of how many tokens this step plans.
+    N_capacity = case.S * case.K
+    s = case.S if num_tokens is None else int(num_tokens)
+    assert 0 < s <= case.S, f"num_tokens {s} outside [1, S={case.S}]"
+    N = s * case.K  # this step's dst length
 
     planning_out_elems = (
         3 * E * R
@@ -338,7 +343,7 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
         + R * B
         + 2 * R
     )
-    n4 = _align_up(N, 4)
+    n4 = _align_up(N_capacity, 4)
     expected_topk0_off = _align_up(int(ctx["PLAN_OFF"]) + planning_out_elems, 4)
     expected_order_off = expected_topk0_off + n4
     expected_order0_off = expected_order_off + n4
@@ -362,7 +367,10 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
         )
 
     if dst.dtype != torch.int32 or tuple(dst.shape) != (N,):
-        errors.append(f"dst must be int32 [{N}], got {dst.dtype} {tuple(dst.shape)}")
+        errors.append(
+            f"dst must be int32 [{N}] (num_tokens={s} * K={case.K}), "
+            f"got {dst.dtype} {tuple(dst.shape)}"
+        )
     else:
         dst_cpu = dst.cpu()
         raw_dst = torch.where(dst_cpu < 0, -dst_cpu - 1, dst_cpu)

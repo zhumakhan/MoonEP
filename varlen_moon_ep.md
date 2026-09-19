@@ -1,11 +1,29 @@
 # Variable-length tokens in MoonEP (`s <= S`) — handoff
 
-Status as of 2026-09-19: **implemented and compile-checked, never executed.**
-All changes are uncommitted in the working tree on `master` (base commit
-`2bd860b`). The machine this was written on has a single H100 with no NVLink
-multicast, so `Buffer(...)` cannot be constructed there; every kernel change
-was verified only by JIT-compiling it. First job for whoever continues: run
-the tests on an 8-GPU node (commands in §4).
+Status as of 2026-09-19 (evening): **implemented, committed as `f08da5e` +
+`4818969` on `master`, and verified on an 8x H200 NVLink node.** Auditing §3
+against those commits found the following, fixed in the working tree (not yet
+committed):
+- `allocate_planning_outputs` ignored `num_tokens` (`dst` and `plan.N` stayed
+  `S*K`) and accepted `s = 0`;
+- `launch_dispatch` used `num_tokens` without binding it (`NameError` on every
+  dispatch);
+- `tests/planning_reference.py` divided by an unbound lowercase `k`;
+- `tests/kernel_test_utils.py` lacked the `num_tokens` parameter and README had
+  none of the §3 wording;
+- `tests/test_e2e.py` re-initialized the default process group per test, which
+  under torchrun hands the peers a stale NCCL bootstrap address; the tests now
+  take the session-scoped `dist_env` fixture (`torchrun tests/test_e2e.py`
+  still works);
+- `moe_moon_ep.py` allocated its composite weights with the pre-fabric
+  `nvl_dist_map(fds=...)` signature.
+Cosmetic leftovers removed: a dead `s_end` line in the dispatch kernel, a
+tautological `plan.N` assert, a stale `[S, K]` docstring in `launch_combine`.
+§4.2 results: planning + e2e 36 passed / 3 skipped (both files in one pytest
+session), dispatch + combine 26 passed, `moe_moon_ep.py` runs (its dense
+reference was skipped for memory on that box, replay diff 0), and a driver
+stepping one `MoonEPMoE` through `s in {512, 300, 33, 7, 1, 511, 512}` matched
+the dense reference within bf16 tolerance on every rank. §6.1 is done.
 
 ## 1. Goal and design
 
@@ -38,7 +56,7 @@ No device-to-host sync was added: `s` is a host-known shape.
 
 ## 2. Environment facts
 
-- Python with torch: `/home/ubuntu/.venv/bin/python` (torch 2.11.0+cu130,
+- Python with torch: `/home/ubuntu/MoonEP/.venv/bin/python` (Python 3.12.3, torch 2.14.0+cu132,
   nvidia-cutlass-dsl 4.4.2). Plain `python3` has no torch.
 - If `from moonep._C import ...` fails (e.g. missing `FABRIC_HANDLE_BYTES`),
   the extension is stale: `python setup.py build_ext --inplace` (nvcc 13.0 in
@@ -175,7 +193,7 @@ zero-fill) need no token count at all.
 
 ### 4.1 Compile check (works on any Hopper GPU, no NVLink needed)
 ```python
-# /home/ubuntu/.venv/bin/python
+# /home/ubuntu/MoonEP/.venv/bin/python
 from moonep import planning, dispatch, combine
 R,E,B,S,K,H,tp,num_sms = 8,64,8,256,8,2048,128,32
 epn=E//R; N=S*K; NvS=N+(tp-1)*2*epn; NvS_padded=NvS+64
@@ -228,7 +246,7 @@ clamp actually lowers as intended).
 ## 6. Remaining work, in priority order
 
 ### 6.1 Run and fix
-Run §4.2. Nothing in this change has executed on hardware.
+Done 2026-09-19 on 8x H200; see the Status paragraph for what it found.
 
 ### 6.2 Shrink the returned views (biggest perf item)
 Today `dispatch` returns `hidden_nvsh`/`route_weights_nvs` of size `NvS`

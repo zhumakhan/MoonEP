@@ -356,7 +356,6 @@ class DispatchKernel:
         # clamp so n_tok never goes negative
         tpb = (num_tokens + self.num_sms - 1) // self.num_sms
         s_beg = bidx * tpb
-        s_end = cutlass.min(s_beg + tpb, S)
         s_end = cutlass.max(cutlass.min(s_beg + tpb, num_tokens), s_beg)
         n_tok = s_end - s_beg
 
@@ -808,7 +807,6 @@ def _check_dispatch_plan(ctx: dict, hidden_sh: torch.Tensor, plan: MoonEPCommPla
     assert N == num_tokens * K, (
         f"plan.N must equal hidden_sh rows*K={num_tokens * K}, got {N}"
     )
-    assert plan.N == N, f"plan.N must be S*K={N}, got {plan.N}"
     assert plan.R == R, f"plan.R must match ctx R={R}, got {plan.R}"
     assert plan.K == K, f"plan.K must match ctx K={K}, got {plan.K}"
     assert plan.NvS == NvS, f"plan.NvS must match ctx NvS={NvS}, got {plan.NvS}"
@@ -902,8 +900,8 @@ def launch_dispatch(
     assert hidden_sh.ndim == 2 and int(hidden_sh.shape[1]) == H \
         and 0 < int(hidden_sh.shape[0]) <= S, \
             f"hidden_sh must be shape [s, H={H}] with 1 <= s <= {S}, got {tuple(hidden_sh.shape)}"
-            
-    
+    num_tokens = int(hidden_sh.shape[0])
+
     _check_dispatch_plan(ctx, hidden_sh, plan)
     assert ctx['hidden_buf'].dtype == torch.bfloat16 and ctx['hidden_buf'].is_contiguous()
     assert ctx['hidden_buf'].device == hidden_sh.device

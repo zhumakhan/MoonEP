@@ -22,7 +22,12 @@ from tests.kernel_test_utils import (
 
 
 def setup():
-    dist.init_process_group(backend="nccl")
+    """Process-group setup for direct ``torchrun tests/test_e2e.py`` runs. Under
+    pytest the tests take the session-scoped ``dist_env`` fixture (conftest)
+    instead: re-initializing the default group inside a torchrun worker reuses
+    the agent store and hands the peers a stale NCCL bootstrap address."""
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     torch.cuda.set_device(local_device_index())
     return rank, dist.get_world_size()
@@ -213,8 +218,8 @@ def assert_raises_assertion(expected_substr, fn):
         raise AssertionError(f"expected AssertionError containing {expected_substr!r}")
 
 
-def test_e2e():
-    rank, R = setup()
+def test_e2e(dist_env):
+    rank, R = dist_env
     S, H, K, E = 256, 1024, 4, R * 4
     B = 2
     Hp = 128
@@ -415,7 +420,6 @@ def test_e2e():
         print("[test_e2e] PASS: public API sync/async, separate prefetch, and plan reuse match.")
 
     buffer.destroy()
-    dist.destroy_process_group()
 
 
 def _e2e_partial_tokens(buffer, rank, R, S, H, K, E, s):
@@ -473,8 +477,8 @@ def _e2e_partial_tokens(buffer, rank, R, S, H, K, E, s):
         )
 
 
-def test_e2e_partial_tokens():
-    rank, R = setup()
+def test_e2e_partial_tokens(dist_env):
+    rank, R = dist_env
     S, H, K, E = 256, 1024, 4, R * 4
     buffer = Buffer(S, H, K, E, R, B=2, num_sms=32)
     # s < num_sms leaves trailing blocks of the per-token loops empty; s = 1 is
@@ -489,9 +493,10 @@ def test_e2e_partial_tokens():
     if rank == 0:
         print("[test_e2e_partial_tokens] PASS: s <= S dispatch/combine round trips match.")
     buffer.destroy()
-    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    test_e2e()
-    test_e2e_partial_tokens()
+    env = setup()
+    test_e2e(env)
+    test_e2e_partial_tokens(env)
+    dist.destroy_process_group()

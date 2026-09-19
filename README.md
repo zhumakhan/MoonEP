@@ -2,9 +2,9 @@
 
 MoonEP is an Expert Parallelism communication library that keeps token loads perfectly balanced across ranks via dynamic redundant experts.
 
-**Notation**: `S` = input tokens per rank, `K` = routed top-k per token.
+**Notation**: `S` = token capacity per rank, `s` = tokens per call (`1 <= s <= S`), `K` = routed top-k per token.
 
-1. **Perfect balance**: every rank receives exactly `S × K` tokens, no matter how skewed the routing is. A small number of redundant experts is planned online from the current router outputs and prefetched before expert computation; their gradients are reduced back to their home ranks in the backward pass.
+1. **Perfect balance**: every rank receives exactly `s × K` tokens, no matter how skewed the routing is. A small number of redundant experts is planned online from the current router outputs and prefetched before expert computation; their gradients are reduced back to their home ranks in the backward pass.
 2. **Online planning**: a near-optimal GPU planning kernel with negligible overhead
 3. **Zero copy and static shapes**: fused permute/unpermute — tokens are sent directly to their expert-grouped positions on remote ranks and buffer views are returned to the computation. Only a fixed `S × K` buffer is needed, and statically known shapes eliminate per-layer MoE host synchronization.
 
@@ -29,7 +29,7 @@ where $T_e$ is the number of tokens routed to expert $e$, and $\bar{T}$ is the e
 <img src="figure/e2e_vs_deepep.png" alt="MoonEP vs DeepEP e2e training" width="800">
 
 - **DeepEP degrades with imbalance**: the hottest ranks receive more tokens, so iteration time climbs steadily as maxvio grows; meanwhile the ever-changing activation shapes fragment GPU memory, until training OOMs at high imbalance.
-- **MoonEP is unaffected**: every rank always computes exactly `S × K` tokens per layer, so iteration time stays flat at every imbalance level; fully static memory shapes mean no fragmentation, and training never OOMs.
+- **MoonEP is unaffected**: every rank always computes exactly `s × K` tokens per layer, so iteration time stays flat at every imbalance level; fully static memory shapes mean no fragmentation, and training never OOMs.
 
 ## Supported Devices
 
@@ -40,7 +40,7 @@ where $T_e$ is the number of tokens routed to expert $e$, and $\bar{T}$ is the e
 
 ### Integration
 
-**Notation**: `S` = input tokens per rank, `K` = routed top-k per token, `E` = total routed experts in the EP group, `R` = number of EP ranks (EP comm size), `B` = weight prefetch slots per rank, `NvS` = dispatched token slots per rank (`S × K` real tokens plus per-VM-group padding), `H` = hidden size, `H'` = expert FFN intermediate size.
+**Notation**: `S` = token capacity per rank (fixed at `Buffer` construction; sizes every buffer), `s` = actual input tokens per rank in a given call (`1 <= s <= S`, must be the same on every rank), `K` = routed top-k per token, `E` = total routed experts in the EP group, `R` = number of EP ranks (EP comm size), `B` = weight prefetch slots per rank, `NvS` = dispatched token slots per rank (`S × K` real-token capacity plus per-VM-group padding), `H` = hidden size, `H'` = expert FFN intermediate size.
 
 MoonEP's contract with a training or inference framework is **one contiguous symmetric-memory weight tensor per expert projection, plus a planner-produced `cu_seqlens`**. The VM group GEMM consumes a single `[E+B, H, H']` weight tensor; `cu_seqlens[E+B]` (returned by `dispatch`) selects which expert rows are active for the current step.
 
@@ -79,14 +79,15 @@ buffer = Buffer(S=4096, H=7168, K=8, E=256, num_ep_ranks=8,
 
 - `num_sms=None` defaults to 32. `B` defaults to `E // num_ep_ranks`; an explicit value like `B=4` may also be passed.
 - `dispatch` / `combine` / `prefetch_weight` / `reduce_grad` all accept `async_finish=True` to run on the comm stream and return a CUDA event.
+- `S` is a capacity, not a per-call shape. Each `dispatch` / `combine` call may pass any `s` tokens with `1 <= s <= S` (`s = hidden_sh.shape[0]`; `route_weights_sk` / `topk_experts_sk` must then be `[s, K]`), as long as every rank passes the same `s` in a given step. Buffers are sized once for `S`; the returned `plan` remembers `s` (`plan.num_tokens`), so `combine` and both backward passes that reuse the plan produce `[s, ...]` outputs and assert that `s` matches. `hidden_nvsh` / `route_weights_nvs` / `cu_seqlens` stay at the fixed `[NvS, ...]` / `[E+B]` capacity shapes.
 
 #### dispatch fwd
 
 ```python
 hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
-    hidden_sh,          # [S, H] bf16
-    route_weights_sk,   # [S, K] fp32
-    topk_experts_sk,    # [S, K] int32
+    hidden_sh,          # [s, H] bf16, any 1 <= s <= S
+    route_weights_sk,   # [s, K] fp32
+    topk_experts_sk,    # [s, K] int32
     tokens_per_expert,  # [E] int32, local count
 )
 # hidden_nvsh:       [NvS, H] bf16 — dispatched tokens in physical VM group order
@@ -112,7 +113,7 @@ grad_hidden_sh, _, _ = buffer.combine(
     plan=plan,
     hidden_nvsh=grad_hidden_nvsh,    # [NvS, H] bf16
 )
-# grad_hidden_sh: [S, H] bf16
+# grad_hidden_sh: [s, H] bf16 (s = plan.num_tokens)
 
 buffer.reduce_grad(
     plan=plan,
@@ -135,8 +136,8 @@ output_sh, gathered_route_weights_sk, _ = buffer.combine(
     hidden_nvsh=expert_output_nvsh,       # [NvS, H] bf16
     route_weights_nvs=route_weights_nvs,  # [NvS] fp32, optional
 )
-# output_sh:                 [S, H] bf16 — combined token-major output
-# gathered_route_weights_sk: [S, K] fp32 or None — routing weights gathered back to token-major
+# output_sh:                 [s, H] bf16 — combined token-major output (s = plan.num_tokens)
+# gathered_route_weights_sk: [s, K] fp32 or None — routing weights gathered back to token-major
 ```
 
 #### combine bwd
@@ -145,7 +146,7 @@ Backward of combine: scatter the output grad back to VM group order by re-dispat
 
 ```python
 grad_expert_output_nvsh, _, _, _ = buffer.dispatch(
-    grad_output_sh,    # [S, H] bf16
+    grad_output_sh,    # [s, H] bf16 (s must equal plan.num_tokens)
     plan=plan,
 )
 # grad_expert_output_nvsh: [NvS, H] bf16

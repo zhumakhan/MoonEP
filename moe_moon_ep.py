@@ -34,7 +34,10 @@ import torch.distributed as dist
 
 from moonep import Buffer
 from moonep._C import nvl_dist_alloc, nvl_dist_map, nvl_release_mem_handle, get_vmm_granularity
-from moonep.buffer import _exchange_ipc_fds, create_nvl_dist_tensor
+from moonep.buffer import (
+    _all_gather_shareables, _exchange_ipc_fds, _use_fabric_for_group,
+    create_nvl_dist_tensor,
+)
 from moonep.inter_rank_sync import launch_inter_rank_sync
 
 
@@ -145,23 +148,40 @@ class MoonEPMoE(nn.Module):
         gran = get_vmm_granularity()
         assert chunk_bytes % gran == 0, \
             f"expert chunk {chunk_bytes} B must be a multiple of VMM granularity {gran}"
-        ka_w, w_fd, w_owned = nvl_dist_alloc(shape=list(chunk_shape), dtype=torch.bfloat16)
-        ka_b, b_fd, b_owned = nvl_dist_alloc(shape=list(chunk_shape), dtype=torch.bfloat16)
+        # Two VMM chunks per rank: the owned expert rows (shared with every
+        # rank) and a local-only chunk for the B prefetch slots. They are mapped
+        # into one contiguous [E + B, ...] VA as R + 1 chunks, using the same
+        # fd / fabric-handle exchange as moonep.buffer.create_nvl_dist_tensor.
+        use_fabric = _use_fabric_for_group(group)
+        ka_w, w_share, w_owned = nvl_dist_alloc(
+            shape=list(chunk_shape), dtype=torch.bfloat16, use_fabric=use_fabric)
+        ka_b, b_share, b_owned = nvl_dist_alloc(
+            shape=list(chunk_shape), dtype=torch.bfloat16, use_fabric=use_fabric)
         for ka, owned in ((ka_w, w_owned), (ka_b, b_owned)):
             self._keepalives.append(ka)
             nvl_release_mem_handle(owned)
-        fds = _exchange_ipc_fds(w_fd, list(range(self.R)), self.rank, self.R, group)
-        os.close(w_fd)
-        all_fds = [fds[r] for r in range(self.R)] + [b_fd]
-        try:
+        if use_fabric:
+            shareables = torch.cat(
+                [_all_gather_shareables(w_share, group), b_share.cpu().view(1, -1)], dim=0)
             full = nvl_dist_map(
                 chunk_shape=list(chunk_shape), dtype=torch.bfloat16,
-                fds=all_fds, local_rank=self.rank, world_size=self.R + 1,
+                shareables=shareables, local_rank=self.rank, world_size=self.R + 1,
+                use_fabric=True,
             )
-        finally:
-            for r in range(self.R):
-                os.close(fds[r])
-            os.close(b_fd)
+        else:
+            w_fd, b_fd = int(w_share.item()), int(b_share.item())
+            fds = _exchange_ipc_fds(w_fd, list(range(self.R)), self.rank, self.R, group)
+            os.close(w_fd)
+            all_fds = [fds[r] for r in range(self.R)] + [b_fd]
+            try:
+                full = nvl_dist_map(
+                    chunk_shape=list(chunk_shape), dtype=torch.bfloat16,
+                    shareables=torch.tensor(all_fds, dtype=torch.int64),
+                    local_rank=self.rank, world_size=self.R + 1, use_fabric=False,
+                )
+            finally:
+                for fd in all_fds:
+                    os.close(fd)
         return full  # [E + B, chunk_shape[1], chunk_shape[2]]
 
     def route(self, x):

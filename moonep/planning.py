@@ -1240,10 +1240,10 @@ def allocate_planning_outputs(ctx: dict, num_tokens: int | None = None):
     E = ctx['E']
     B = ctx.get('B', 0)
     S = int(ctx['S'])
-    K = ctx['K']
-    N = S * K
+    K = int(ctx['K'])
     s = S if num_tokens is None else int(num_tokens)
-    assert 0 <= s <= S, f"num_token must be in [1, S={S}], got {s}"
+    assert 0 < s <= S, f"num_tokens must be in [1, S={S}], got {s}"
+    N = s * K
     NvS = ctx['NvS']
     dev = ctx['meta_buf'].device
 
