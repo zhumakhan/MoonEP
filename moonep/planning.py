@@ -49,6 +49,12 @@ class MoonEPCommPlan:
     dup_loffs: torch.Tensor
     dup_counts: torch.Tensor
 
+    @property
+    def num_tokens(self) -> int:
+        """Tokens per rank this plan was made for (``N // K``), <= Buffer S."""
+        return int(self.N) // int(self.K)
+    
+    
     def __post_init__(self) -> None:
         N = int(self.N)
         R = int(self.R)
@@ -281,12 +287,12 @@ def reg_scan_argmin_min_idx(reg, N: cutlass.Constexpr, lane):
 
 
 @cute.jit
-def copy_v4_remote(dst, dst_off, src, n: cutlass.Constexpr,
+def copy_v4_remote(dst, dst_off, src, n,
                    pid, tid, nth, num_sms):
     # src[n] -> dst[dst_off:]: scalar head pads to 16B, int4 body does one
     # 128bit store (transactions /4), scalar tail.
     # dst_off may be arbitrarily aligned (dst.iterator is 16B aligned); no src
-    # padding needed.
+    # padding needed. n could be a runtime Int32 count
     head = (-dst_off) & 3                      # make dst_off+head ≡0 mod4 so v4 addresses are 16B aligned
     nv = (n - head) >> 2                       # number of vectorizable 4-tuples
 
@@ -366,7 +372,10 @@ class PlanningKernel:
     def __call__(self, tpe, topk, meta, mc, dst, cu_seqlens,
                  experts_to_copy, zero_fill, remote_stats, alloc, group_tokens, z,
                  local_hist, bar,
-                 rank: Int32, stream: cuda.CUstream):
+                 rank: Int32, num_tokens: Int32, stream: cuda.CUstream):
+        # num_tokens: this step's token count per rank, 1 <= token_count <= S.
+        # S (N = S*K) stay compile time capacities for layout/strides
+        
         R = cutlass.const_expr(self.R)
         ms = cutlass.const_expr(self.meta_stride)
         N = cutlass.const_expr(self.N)
@@ -388,7 +397,7 @@ class PlanningKernel:
 
         self.kernel(tpe_t, topk_t, meta_t, mc_t, dst_t, cu_t, etc_t,
                     zfr_t, stats_t, alloc_t, gt_t, z_t, lh_t, bar_t,
-                    rank).launch(
+                    rank, num_tokens).launch(
             grid=(num_sms, 1, 1), block=(BLOCK_DIM_P2, 1, 1),
             stream=stream, cooperative=True)
 
@@ -397,7 +406,10 @@ class PlanningKernel:
     # =========================================================
     @cute.jit
     def run_c1(self, topk_src, order_dst, tpe_src, local_hist, s_hist, s_bp, s_wcount,
-               bar_ptr, num_sms, pid, tid):
+               bar_ptr, num_sms, pid, tid, n_rt):
+        # n_rt: runtime number of valid top-k entries (= num_tokens * K),
+        # n_rt <= N. Only the first ceil(n_rt / BLOCK_SIZE_P2) vblocks carry
+        # data; the tensors below keep their compile time capacity layout
         R = cutlass.const_expr(self.R)
         E = cutlass.const_expr(self.E)
         NUM_WARPS = cutlass.const_expr(BLOCK_DIM_P2 // 32)
@@ -405,6 +417,7 @@ class PlanningKernel:
         IPT = cutlass.const_expr(ITEMS_PER_THREAD_P2)
         N = cutlass.const_expr(self.N)
         num_vblocks = cutlass.const_expr(self.num_vblocks)
+        nvb_rt = (n_rt + BLOCK_SIZE_P2 - 1) // BLOCK_SIZE_P2
         num_threads = BLOCK_DIM_P2
         warp = tid >> 5
         lane = tid & 31
@@ -424,7 +437,7 @@ class PlanningKernel:
         )
 
         # 1a
-        for vb in cutlass.range(pid, num_vblocks, num_sms):
+        for vb in cutlass.range(pid, nvb_rt, num_sms):
             for e in cutlass.range(tid, E, num_threads):
                 s_histogram[e] = 0
 
@@ -433,7 +446,7 @@ class PlanningKernel:
             chunk = vb * BLOCK_SIZE_P2
             for p in cutlass.range(tid, BLOCK_SIZE_P2, num_threads):
                 off = chunk + p
-                if off < N:
+                if off < n_rt:
                     expert = topk_in[off]
                     cute.arch.atomic_add(elem_ptr(s_histogram, expert), 1, scope="cta")
 
@@ -450,8 +463,8 @@ class PlanningKernel:
         e_lo = pid * experts_per_block
         e_hi = cutlass.min(e_lo + experts_per_block, E)
         for e in cutlass.range(e_lo + tid, e_hi, num_threads):
-            cumsum = 0
-            for vb in cutlass.range_constexpr(num_vblocks):
+            cumsum = Int32(0)
+            for vb in cutlass.range(nvb_rt):
                 v = vblocks_histogram[vb, e]
                 vblocks_histogram[vb, e] = cumsum
                 cumsum += v
@@ -463,7 +476,7 @@ class PlanningKernel:
         cute.arch.barrier()
         warp_exclusive_scan_e(s_histogram, E, tid)
         lanes_lt = (Uint32(1) << lane) - Uint32(1)
-        for vb in cutlass.range(pid, num_vblocks, num_sms):
+        for vb in cutlass.range(pid, nvb_rt, num_sms):
             chunk = vb * BLOCK_SIZE_P2
             my_e = []; my_p = []
             for i in cutlass.range_constexpr(IPT):
@@ -471,7 +484,7 @@ class PlanningKernel:
                 off = chunk + p
                 my_p.append(p)
                 ev = E
-                if off < N:
+                if off < n_rt:
                     ev = topk_in[off]
                 my_e.append(ev)
 
@@ -519,12 +532,16 @@ class PlanningKernel:
     @cute.kernel
     def kernel(self, tpe, topk, meta, mc, dst, cu_seqlens,
                experts_to_copy, zfr, remote_stats, alloc, group_tokens, z, lh, bar,
-               rank: Int32):
+               rank: Int32, num_tokens: Int32):
         R = cutlass.const_expr(self.R)
         E = cutlass.const_expr(self.E)
         B = cutlass.const_expr(self.B)
-        S = cutlass.const_expr(self.S)
         K = cutlass.const_expr(self.K)
+        # Runtime extents of this step: n_rt valid top-k entries per rank and
+        # the per-rank receive target cap_rt (every rank ends up with exactly cap_rt tokens after balancing)
+        # Both are <= their compile time capacities N / NvS_capacity, which still size every buffer
+        n_rt = num_tokens * K
+        cap_rt = n_rt
         epn = cutlass.const_expr(E // R)
         LOG2_R = cutlass.const_expr(log2_r(R))
         EB_PAD = cutlass.const_expr(ceil_pow2(E + B))
@@ -532,7 +549,6 @@ class PlanningKernel:
         ms = cutlass.const_expr(self.meta_stride)
         N = cutlass.const_expr(self.N)
         NvS = cutlass.const_expr(self.NvS)
-        CAP = cutlass.const_expr(self.NvS_capacity)
         tp = cutlass.const_expr(self.token_padding)
         num_sms = cutlass.const_expr(self.num_sms)
         TPE_OFF = cutlass.const_expr(self.TPE_OFF)
@@ -604,7 +620,7 @@ class PlanningKernel:
         if cutlass.const_expr(R > 1):
             if rank == 0:
                 # The TOPK0/TPE region of alloc is guaranteed 16B aligned: topk/tpe push goes v4 (tail padded internally).
-                copy_v4_remote(meta, ms + TOPK0_OFF, topk, N, pid, tid, num_threads, num_sms)
+                copy_v4_remote(meta, ms + TOPK0_OFF, topk, n_rt, pid, tid, num_threads, num_sms)
                 copy_v4_remote(meta, ms + TPE_OFF, tpe, E, pid, tid, num_threads, num_sms)
         cross_rank_barrier(meta, ms, BARRIER_OFF, rank, R, bar_p, num_sms, num_threads, tid)
         if rank == 0:
@@ -672,13 +688,16 @@ class PlanningKernel:
                 if tid < 32:
                     lane = tid
                     # balance stays in registers throughout: lane holds
-                    # bal[j]=group_tokens[lane+j*32]-CAP, CHUNK=ceil(R/32).
+                    # bal[j]=group_tokens[lane+j*32]-cap_rt, CHUNK=ceil(R/32).
+                    # cap_rt = num_tokens * K is this step's per rank target;
+                    # the sum over ranks is exactly R*cap_rt, so balancing
+                    # terminates with every rank at cap_rt (<= CAP capacity).
                     CHUNK = cutlass.const_expr(ceil_div(R, 32))
                     balance = cute.make_rmem_tensor(CHUNK, Int32)
                     for j in cutlass.range_constexpr(CHUNK):
                         k = lane + j * 32
                         balance[j] = 0
-                        if k < R: balance[j] = group_tokens[k] - CAP
+                        if k < R: balance[j] = group_tokens[k] - cap_rt
                     keep_balancing = True
                     while keep_balancing:
                         # surplus takes max (larger balance first, smaller rank
@@ -961,15 +980,17 @@ class PlanningKernel:
         order = cute.make_tensor(meta.iterator + (rank * ms + ORDER_OFF), cute.make_layout((N,)))
         if cutlass.const_expr(R > 1):
             if rank != 0:
-                self.run_c1(topk, order, tpe, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid)
+                self.run_c1(topk, order, tpe, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid, n_rt)
                 if rank == 1:
+                    # Rank 1 also orders rank 0's top-k (offloaded above). This
+                    # relies on every rank passing the same num_tokens.
                     tk0 = cute.make_tensor(meta.iterator + (rank * ms + TOPK0_OFF), cute.make_layout((N,)))
                     tp0 = cute.make_tensor(meta.iterator + (rank * ms + TPE_OFF), cute.make_layout((E,)))
                     order0 = cute.make_tensor(meta.iterator + (rank * ms + ORDER0_OFF), cute.make_layout((N,)))
-                    self.run_c1(tk0, order0, tp0, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid)
-                    copy_v4_remote(meta, ORDER_OFF, order0, N, pid, tid, num_threads, num_sms)
+                    self.run_c1(tk0, order0, tp0, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid, n_rt)
+                    copy_v4_remote(meta, ORDER_OFF, order0, n_rt, pid, tid, num_threads, num_sms)
         else:
-            self.run_c1(topk, order, tpe, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid)
+            self.run_c1(topk, order, tpe, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid, n_rt)
         # Clear this rank's src_info slice before all ranks publish fresh slot
         # provenance into destination-rank slices below. src_info mirrors dst's
         # rank-stride encoding: src_rank * NvS + offv; -1 is the empty-slot
@@ -1045,8 +1066,8 @@ class PlanningKernel:
             _pd_issue_g2s(meta, s_pd_zfr_stage, zfr_src_begin, zfr_copy_count, pd_mbar)
             _pd_issue_g2s(meta, s_pd_etc_stage, etc_src_begin, etc_copy_count, pd_mbar)
         cute.arch.barrier()
-        seg = cute.ceil_div(N, num_sms)
-        sbeg = pid * seg; send = cutlass.min(sbeg + seg, N)
+        seg = cute.ceil_div(n_rt, num_sms)
+        sbeg = pid * seg; send = cutlass.min(sbeg + seg, n_rt)
         for base in cutlass.range(sbeg + tid, send, num_threads * ITEMS_PER_THREAD_P2):
             for i in cutlass.range_constexpr(ITEMS_PER_THREAD_P2):
                 idx = base + i * BLOCK_DIM_P2
@@ -1080,8 +1101,8 @@ class PlanningKernel:
         # destination rank stays non-negative and copies the payload; later
         # entries encode -raw_dst - 1 and only carry weights. Fresh dispatch
         # materializes the dedup structures from src_info.
-        seg_dst = cute.ceil_div(S, num_sms)
-        sbeg_dst = pid * seg_dst; send_dst = cutlass.min(sbeg_dst + seg_dst, S)
+        seg_dst = cute.ceil_div(num_tokens, num_sms)
+        sbeg_dst = pid * seg_dst; send_dst = cutlass.min(sbeg_dst + seg_dst, num_tokens)
         for base in cutlass.range(sbeg_dst + tid, send_dst, num_threads):
             s = base
             base_idx = s * K
@@ -1144,12 +1165,16 @@ def _get_compiled(R, E, B, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                        token_padding, num_sms)
     i32 = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
     return cute.compile(k, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32,
-                        i32, i32, i32, i32, Int32(0), cuda.CUstream(0))
+                        i32, i32, i32, i32, Int32(0), Int32(0), cuda.CUstream(0))
 
 
 def _launch_planning_kernel(ctx, topk, tpe, dst, cu_seqlens,
-                            experts_to_copy, zero_fill_ranges, remote_stats):
+                            experts_to_copy, zero_fill_ranges, remote_stats,
+                            num_tokens):
     assert int(ctx['B']) > 0, f"planning requires B > 0, got B={int(ctx['B'])}"
+    assert 0 < int(num_tokens) <= int(ctx['S']), (
+        f"num_tokens must be in [1, S={int(ctx['S'])}], got {num_tokens}"
+    )
     comp = _get_compiled(
         int(ctx['R']),
         int(ctx['E']),
@@ -1191,6 +1216,7 @@ def _launch_planning_kernel(ctx, topk, tpe, dst, cu_seqlens,
         p16(ctx['local_hist']),
         p16(ctx['grid_sync_bar']),
         Int32(int(ctx['rank'])),
+        Int32(int(num_tokens)),
         stream,
     )
 
@@ -1199,18 +1225,25 @@ def _round4(n):
     return (n + 3) & ~3
 
 
-def allocate_planning_outputs(ctx: dict):
+def allocate_planning_outputs(ctx: dict, num_tokens: int | None = None):
     """Allocate a ``(MoonEPCommPlan, cu_seqlens)`` pair on the current stream.
 
     The plan-owned dedup tensors are allocated here so the returned plan is
     complete, but fresh planning leaves their contents for the dispatch builder
     to materialize.
+    
+    Args:
+        num_tokens: this step's token count per rank (``1 <= num_tokens <= S``);
+            None means the Buffer capacity ``S``. The plan's  ``N`` becomes
+            ``num_tokens * K`` and sizes ``dst``.
     """
     E = ctx['E']
     B = ctx.get('B', 0)
-    S = ctx['S']
+    S = int(ctx['S'])
     K = ctx['K']
     N = S * K
+    s = S if num_tokens is None else int(num_tokens)
+    assert 0 <= s <= S, f"num_token must be in [1, S={S}], got {s}"
     NvS = ctx['NvS']
     dev = ctx['meta_buf'].device
 
@@ -1254,7 +1287,13 @@ def _check_planning_outputs(ctx: dict, cu_seqlens, plan) -> None:
     assert isinstance(plan, MoonEPCommPlan)
     E = ctx['E']
     B = ctx.get('B', 0)
-    assert plan.N == ctx['S'] * ctx['K']
+    K = int(ctx['K'])
+    # plan.N = num_tokens * K for this step; S * K is only the capacity bound.
+    assert plan.N % K == 0 and 0 < plan.N <= int(ctx['S']) * K, (
+        f"plan.N must be num_tokens * K with 1 <= num_tokens <= S={int(ctx['S'])}, "
+        f"got N={plan.N}, K={K}"
+    )
+    
     assert plan.R == ctx['R']
     assert plan.E == E
     assert plan.B == B
@@ -1308,9 +1347,14 @@ def launch_planning(
     """
     _check_planning_outputs(ctx, cu_seqlens, plan)
     _check_dedup_encoding_bounds(ctx)
+    assert topk_experts_flat.numel() == plan.N, (
+        f"topk_experts_flat must have plan.N={plan.N} entries "
+        f"(num_tokens*K), got {topk_experts_flat.numel()}"
+    )
 
     _launch_planning_kernel(
         ctx, topk_experts_flat, tokens_per_expert,
         plan.dst, cu_seqlens, plan.experts_to_copy,
         plan.zero_fill_ranges, plan.remote_stats,
+        plan.num_tokens
     )

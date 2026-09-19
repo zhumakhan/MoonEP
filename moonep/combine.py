@@ -137,6 +137,7 @@ class CombineKernel:
         rank: Int32,
         weights_off: Int32,
         barrier_off: Int32,
+        num_tokens: Int32, # this step's tokens per rank,  <= S
         stream: cuda.CUstream,
     ):
         H = cutlass.const_expr(self.H)
@@ -196,6 +197,7 @@ class CombineKernel:
             rank,
             weights_off,
             barrier_off,
+            num_tokens,
         ).launch(
             grid=(self.num_sms, 1, 1),
             block=(self.num_threads, 1, 1),
@@ -219,6 +221,7 @@ class CombineKernel:
         rank: Int32,
         weights_off: Int32,
         barrier_off: Int32,
+        num_tokens: Int32,
     ):
         H = cutlass.const_expr(self.H)
         S = cutlass.const_expr(self.S)
@@ -296,10 +299,12 @@ class CombineKernel:
         # CUTLASS pipelines / __syncthreads). 4 ACC warps = 128 threads.
         acc_bar = pipeline.NamedBarrier(barrier_id=8, num_threads=self.ACC_THREADS)
 
-        # ----- per-block token range
-        tpb = (S + self.num_sms - 1) // self.num_sms
+        # ------ per-block token range over this step's num_tokens (<=S)
+        # When num_tokens < num_sms, trailing blocks start past the end;
+        # clamp so n_tok never goes negative.
+        tpb = (num_tokens + self.num_sms - 1) // self.num_sms
         s_beg = bidx * tpb
-        s_end = cutlass.min(s_beg + tpb, S)
+        s_end = cutlass.max(cutlass.min(s_beg + tpb, num_tokens), s_beg)
         n_tok = s_end - s_beg
 
         # ============================================
@@ -558,6 +563,7 @@ def _get_compiled(
         Int32(0),  # rank
         Int32(0),  # weights_off
         Int32(0),  # barrier_off
+        Int32(0),  # num_tokens
         stream_arg,
     )
 
@@ -573,9 +579,9 @@ def launch_combine(
     """Launch the combine kernel.
 
     Args:
-        output_sh: [S, H] bf16 output buffer to receive the per-token
-            accumulated result.
-        dst: [N=S*K] int32 routing offsets (must match the dispatch that
+        output_sh: [s, H] bf16 output buffer to receive the per-token
+            accumulated result, 1 <= s <= S (the Buffer capacity)
+        dst: [N=s*K] int32 routing offsets (must match the dispatch that
             populated hidden_buf / weights_buf). Non-negative entries encode
             ``dest_rank * NvS + local_offset`` and are pulled and accumulated.
             Negative entries encode the same raw destination as
@@ -615,6 +621,20 @@ def launch_combine(
     num_sms = int(ctx['num_sms'])
     device_index = output_sh.device.index
 
+    # output-sh rows = this step's token count (<=S); dst carries K entries
+    # per token and output_sk one row per token
+    assert output_sh.ndim == 2 and int(output_sh.shape[1]) == H \
+        and 0 < int(output_sh.shape[0]) <= S, \
+            f"output_sh must be shape [s, H={H}] with 1 <= s <= S={S}, " \
+            f"got {tuple(output_sh.shape)}"
+    num_tokens = int(output_sh.shape[0])
+    assert dst.numel() == num_tokens * K, \
+        f"dst must have s*K={num_tokens*K} entries, got {dst.numel()}"
+    if with_weights:
+        assert tuple(output_sk.shape) == (num_tokens, K), \
+            f"output_sk must be shape [s={num_tokens}, K={K}], " \
+            f"got {tuple(output_sk.shape)}"
+    
     compiled = _get_compiled(
         H, R, S, K, NvS, NvS_padded, meta_stride,
         num_sms, with_weights, device_index,
@@ -650,5 +670,6 @@ def launch_combine(
         Int32(int(ctx['rank'])),
         Int32(int(ctx['WEIGHTS_OFF'])),
         Int32(int(ctx['BARRIER_OFF'])),
+        Int32(num_tokens),
         stream,
     )
