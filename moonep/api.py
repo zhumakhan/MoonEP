@@ -734,10 +734,12 @@ class Buffer:
         to their expert-grouped positions on remote ranks.
 
         Args:
-            hidden_sh: [S, H] bf16 input tokens.
-            route_weights_sk: [S, K] fp32 routing weights; None skips the
+            hidden_sh: [s, H] bf16 input tokens, for any 1 <= s <= S (the 
+                capacity the Buffer was constructed with). Every rank must pass 
+                the same s in a given step.
+            route_weights_sk: [s, K] fp32 routing weights; None skips the
                 weights buffer entirely.
-            topk_experts_sk: [S, K] int32 expert ids; required when ``plan``
+            topk_experts_sk: [s, K] int32 expert ids; required when ``plan``
                 is None.
             tokens_per_expert: [E] int32 local token count per expert;
                 required when ``plan`` is None.
@@ -781,18 +783,36 @@ class Buffer:
         """
         ctx = self._require_ctx()
 
+        # Runtime token count for this step: any 1 <= s <= S (the capacity the 
+        # Buffer was built with). Kernels loop to s; layouts stay at S.
+        assert hidden_sh.ndim == 2, \
+            f"hidden_sh must be [s, H], got {tuple(hidden_sh.shape)}"
+        num_tokens = int(hidden_sh.shape[0])
+        assert 0 < num_tokens <= int(ctx['S']), (
+            f"hidden_sh has {num_tokens} tokens; Buffer capacity S={int(ctx['S'])}"
+        )
+
         if plan is None:
             assert topk_experts_sk is not None and tokens_per_expert is not None
             topk_flat = topk_experts_sk.reshape(-1)
-            assert topk_flat.dtype == torch.int32 and topk_flat.numel() == int(ctx['N'])
+            assert topk_flat.dtype == torch.int32 and \
+                topk_flat.numel() == num_tokens * int(ctx['K']), (
+                    f"topk_experts_sk must be [s={num_tokens}, K={int(ctx['K'])}], "
+                    f"got {tuple(topk_experts_sk.shape)}"
+                )
             assert tokens_per_expert.dtype == torch.int32
             assert tokens_per_expert.numel() == int(ctx['E']) and tokens_per_expert.is_contiguous()
-            plan, cu_seqlens = allocate_planning_outputs(ctx)
+            plan, cu_seqlens = allocate_planning_outputs(ctx, num_tokens)
             planning_args = (topk_flat, tokens_per_expert, cu_seqlens)
         else:
             cu_seqlens = None
             planning_args = None
             assert isinstance(plan, MoonEPCommPlan)
+            assert plan.num_tokens == num_tokens, (
+                f"plan was made for {plan.num_tokens} tokens, "
+                f"hidden_sh has {num_tokens}"
+            )
+            
 
         if zero_copy:
             hidden_nvsh = ctx['hidden_buf_local']
@@ -987,9 +1007,9 @@ class Buffer:
         Returns:
             ``(hidden_sh, route_weights_sk, event)``:
 
-            - hidden_sh: [S, H] bf16 combined token-major output, allocated
-              by MoonEP.
-            - route_weights_sk: [S, K] fp32 gathered routing weights, or None
+            - hidden_sh: [s, H] bf16 combined token-major output, allocated
+              by MoonEP, with ``s = plan.num_tokens``.
+            - route_weights_sk: [s, K] fp32 gathered routing weights, or None
               when ``route_weights_nvs`` is None.
             - event: comm-stream CUDA event when ``async_finish=True``, else
               None.
@@ -1020,14 +1040,14 @@ class Buffer:
             )
 
         hidden_sh = torch.empty(
-            int(ctx['S']),
+            plan.num_tokens,
             int(ctx['H']),
             dtype=hidden_nvsh.dtype,
             device=hidden_nvsh.device,
         )
         route_weights_sk = (
             torch.empty(
-                int(ctx['S']),
+                plan.num_tokens,
                 int(ctx['K']),
                 dtype=torch.float32,
                 device=hidden_nvsh.device,

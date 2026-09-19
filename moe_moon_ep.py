@@ -172,7 +172,10 @@ class MoonEPMoE(nn.Module):
         tpe = torch.bincount(topk.flatten(), minlength=self.E).to(torch.int32)
         return weights.contiguous(), topk.contiguous(), tpe
 
-    def forward_full_S(self, x):
+    def forward(self, x):
+        """[s, H] -> [s, H] for any 1 <= s <= S. S is only the Buffer's
+        capacity: the comm kernels loop over s, no padding tokens are made.
+        """
         weights, topk, tpe = self.route(x)
 
         # dispatch: scatter tokens to their experts' home/copy ranks over
@@ -217,17 +220,6 @@ class MoonEPMoE(nn.Module):
         # rank and sum -> [S, H] (backward: re-dispatch with the saved plan)
         return _MoonEPCombine.apply(z, self.buffer, plan)
 
-    def forward(self, x):
-        """Forward for inputs with fewer than S tokens: pad to S (the Buffer's
-        shapes are baked at construction), slice the padding away after combine."""
-        s = x.size(0)
-        S = int(self.buffer._require_ctx()['S'])
-        assert s <= S, f"got {s} tokens, Buffer was built for at most {S}"
-        if s == S:
-            return self.forward_full_S(x)
-        x_pad = torch.zeros(S, x.size(1), dtype=x.dtype, device=x.device)
-        x_pad[:s] = x
-        return self.forward_full_S(x_pad)[:s]
 
     def reduce_expert_grads(self):
         """dispatch bwd, weight side: ship the prefetch-slot (copied expert)

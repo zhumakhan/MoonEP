@@ -33,16 +33,24 @@ def launch_planning_torch_reference(
     R = ctx["R"]
     E = ctx["E"]
     B = int(ctx["B"])
-    S = ctx["S"]
     K = ctx["K"]
-    N = S * K
     epn = E // R
-    CAP = ctx["NvS_capacity"]
-    NvS = ctx.get("NvS", CAP) # TODO: a bit odd; this lets scans omit NvS
+    NvS = ctx.get("NvS", ctx['NvS_capacity']) # TODO: a bit odd; this lets scans omit NvS
     token_padding = ctx.get("token_padding", 1)
     group = ctx.get("group")
 
     flat_topk_experts = topk_experts[rank].reshape(-1) if topk_experts.dim() == 3 else topk_experts.reshape(-1)
+    # this step's token count per rank comes from the routing input, not the
+    # Buffer: any 1 <= S <= ctx['S'] is valid (same S on every rank). The
+    # per rank receive target CAP follows it; ctx['NvS_capacity'] is only the 
+    # buffer bound
+    N = int(flat_topk_experts.numel())
+    assert N % K == 0, f"topk entries {N} not a multiple of K={K}"
+    S = N // k
+    assert 0 < S <= int(ctx['S']), f"num_tokens {S} outside [1, S={int(ctx['S'])}]"
+    CAP = N
+    assert CAP <= int(ctx["NvS_capacity"])
+    
     if tokens_per_expert.dim() == 2:
         tpe = tokens_per_expert
     else:

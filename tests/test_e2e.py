@@ -418,5 +418,80 @@ def test_e2e():
     dist.destroy_process_group()
 
 
+def _e2e_partial_tokens(buffer, rank, R, S, H, K, E, s):
+    """dispatch -> combine round trip with s <= S tokens per rank. The Buffer's
+    S is only a capacity: the kernels loop over s and no padding tokens exist."""
+    ctx = buffer._require_ctx()
+    hidden, weights, topk, tpe = make_inputs(rank, s, H, K, E, seed=100 + s)
+
+    # --- fresh planning at s tokens ---
+    h_sync, w_sync, cu_sync, plan = buffer.dispatch(hidden, weights, topk, tpe)
+    torch.cuda.synchronize()
+    assert plan.num_tokens == s and plan.N == s * K, f"s={s}: plan sized {plan.N}"
+    assert tuple(plan.dst.shape) == (s * K,), f"s={s}: dst shape {tuple(plan.dst.shape)}"
+    # every rank receives exactly s*K real tokens plus per-group padding
+    total = int(cu_sync[-1].item())
+    pad_extra = int(ctx["token_padding_extra"])
+    assert s * K <= total <= s * K + pad_extra, \
+        f"s={s}: padded total {total} outside [{s * K}, {s * K + pad_extra}]"
+    h_snap, w_snap = h_sync[:total].clone(), w_sync[:total].clone()
+
+    # --- async path gives the same plan and shard ---
+    h_a, w_a, cu_a, plan_a, ev = buffer.dispatch(
+        hidden, weights, topk, tpe, async_finish=True,
+    )
+    ev.wait(torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    assert torch.equal(cu_sync, cu_a), f"s={s}: cu_seqlens mismatch"
+    assert torch.equal(plan.dst, plan_a.dst), f"s={s}: dst mismatch"
+    assert torch.equal(h_snap, h_a[:total]), f"s={s}: dispatch hidden mismatch"
+    assert torch.equal(w_snap, w_a[:total]), f"s={s}: dispatch weights mismatch"
+
+    # --- identity "FFN": combine sums each token's K dispatched copies, so
+    # the round trip returns K * hidden (up to one bf16 rounding when
+    # duplicate slots are pre-reduced in the combine prologue) ---
+    h_c, w_c, _, _ = buffer.dispatch(hidden, weights, topk, tpe)
+    out, gathered, _ = buffer.combine(
+        plan=plan, hidden_nvsh=h_c, route_weights_nvs=w_c,
+    )
+    torch.cuda.synchronize()
+    assert tuple(out.shape) == (s, H), f"s={s}: combine output {tuple(out.shape)}"
+    assert tuple(gathered.shape) == (s, K), f"s={s}: gathered weights {tuple(gathered.shape)}"
+    expected = hidden.float() * K
+    assert torch.allclose(out.float(), expected, rtol=2e-2, atol=1e-2), \
+        f"s={s}: combine(dispatch(x)) != K*x, max diff {(out.float() - expected).abs().max().item()}"
+    assert torch.equal(gathered, weights), f"s={s}: route weight gather mismatch"
+
+    # --- plan reuse (the backward paths) carries s along ---
+    h_r, w_r, cu_r, plan_r = buffer.dispatch(hidden, plan=plan)
+    torch.cuda.synchronize()
+    assert cu_r is None and w_r is None and plan_r is plan
+    assert torch.equal(h_r[:total], h_snap), f"s={s}: plan-reuse hidden mismatch"
+    if s > 1:
+        assert_raises_assertion(
+            "tokens", lambda: buffer.dispatch(hidden[: s - 1], plan=plan),
+        )
+
+
+def test_e2e_partial_tokens():
+    rank, R = setup()
+    S, H, K, E = 256, 1024, 4, R * 4
+    buffer = Buffer(S, H, K, E, R, B=2, num_sms=32)
+    # s < num_sms leaves trailing blocks of the per-token loops empty; s = 1 is
+    # the smallest step. Then full capacity on the same Buffer.
+    for s in (S // 2 + 3, 5, 1, S):
+        _e2e_partial_tokens(buffer, rank, R, S, H, K, E, s)
+    # a step larger than the capacity is rejected up front
+    hidden, weights, topk, tpe = make_inputs(rank, S + 1, H, K, E, seed=7)
+    assert_raises_assertion(
+        "capacity", lambda: buffer.dispatch(hidden, weights, topk, tpe),
+    )
+    if rank == 0:
+        print("[test_e2e_partial_tokens] PASS: s <= S dispatch/combine round trips match.")
+    buffer.destroy()
+    dist.destroy_process_group()
+
+
 if __name__ == "__main__":
     test_e2e()
+    test_e2e_partial_tokens()

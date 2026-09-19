@@ -5,6 +5,7 @@ Run with:
 """
 
 import pytest
+import torch
 from tests.kernel_test_utils import (
     DEFAULT_TOKEN_PADDING,
     KernelCase,
@@ -255,6 +256,66 @@ def test_planning_step1_case_coverage():
     assert any(p["experts_per_block"] > p["s1_cols"] for p in params)
     assert any(p["has_segment_tail"] for p in params)
     assert any(p["work_ctas"] > 1 and p["group_spans_ctas"] for p in params)
+
+
+@pytest.mark.parametrize("case", case_params(PLANNING_CASES))
+def test_planning_partial_tokens_matches_reference(dist_env, case):
+    """Plan s < S tokens on a Buffer built for S. The kernel loops over the
+    runtime s, the torch reference derives s from the routing input, and every
+    rank must still end up with exactly s*K tokens (plus segment padding)."""
+    from moonep.planning import allocate_planning_outputs, launch_planning
+
+    rank, R = dist_env
+    skip_if_unsupported_world_size(case, R)
+    if case.S < 2:
+        pytest.skip("partial-token planning needs S >= 2")
+
+    ctx = init_case(case, R)
+    topk_full, _ = make_topk(case, rank, R)
+    E = case.E(R)
+    # 1 token, half the capacity, and one below it; s below num_sms leaves
+    # some planning CTAs with an empty token range.
+    for s in sorted({1, case.S // 2, case.S - 1}):
+        topk = topk_full[:s].contiguous()
+        tpe = torch.bincount(topk.flatten(), minlength=E).to(torch.int32)
+
+        plan, cu_seqlens = allocate_planning_outputs(ctx, s)
+        assert plan.num_tokens == s and plan.N == s * case.K
+        launch_planning(ctx, topk.reshape(-1).contiguous(), tpe, cu_seqlens, plan)
+        (
+            ref_dst,
+            ref_cu_seqlens,
+            ref_experts_to_copy,
+            ref_remote_stats,
+            ref_zero_fill_ranges,
+            _ref_dedup_plan,
+        ) = launch_planning_torch_reference(ctx, topk, tpe)
+
+        tag = f"[s={s}/{case.S}]"
+        assert_tensor_equal_all_ranks(f"cu_seqlens{tag}", cu_seqlens, ref_cu_seqlens, rank, R)
+        assert_tensor_equal_all_ranks(
+            f"zero_fill_ranges{tag}", plan.zero_fill_ranges, ref_zero_fill_ranges, rank, R
+        )
+        assert_tensor_equal_all_ranks(
+            f"experts_to_copy{tag}", plan.experts_to_copy, ref_experts_to_copy, rank, R
+        )
+        assert_tensor_equal_all_ranks(
+            f"remote_stats{tag}", plan.remote_stats, ref_remote_stats, rank, R
+        )
+        assert_tensor_equal_all_ranks(
+            f"dst{tag}", plan.dst.reshape(s, case.K), ref_dst.reshape(s, case.K), rank, R
+        )
+
+        errors = planning_invariant_errors(
+            case, ctx, plan.dst, cu_seqlens, plan.experts_to_copy, num_tokens=s
+        )
+        assert_all_ranks(
+            not errors,
+            rank,
+            R,
+            f"{case.name} {tag} planning invariants",
+            "; ".join(errors[:5]),
+        )
 
 
 @pytest.mark.parametrize("case", case_params(PLANNING_CASES))
