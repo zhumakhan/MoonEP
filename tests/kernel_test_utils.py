@@ -79,13 +79,29 @@ def skip_if_unsupported_world_size(case, R):
         pytest.skip(f"case {case.name} requires R <= {case.max_R}, got R={R}")
 
 
-def make_topk(case, rank, R):
+def partial_token_counts(S):
+    """The partial-step sizes the unit tests plan on a Buffer of capacity S:
+    one token, half the capacity and one below it. Callers skip S < 2."""
+    return sorted({1, S // 2, S - 1})
+
+
+def make_topk(case, rank, R, s=None):
+    """Routing for this rank. ``s`` (default ``case.S``) keeps the first ``s``
+    tokens of the full-S routing and recomputes ``tokens_per_expert``, so a
+    partial step routes exactly like the prefix of the full one."""
     skip_if_unsupported_world_size(case, R)
 
     dev = "cuda"
     E = case.E(R)
     if case.K > E and case.routing in {"balanced", "biased"}:
         pytest.skip(f"case {case.name} requires K <= E, got K={case.K}, E={E}")
+
+    if s is not None:
+        assert 0 < int(s) <= case.S, f"num_tokens {s} outside [1, S={case.S}]"
+        topk_full, _ = make_topk(case, rank, R)
+        topk = topk_full[: int(s)].contiguous()
+        tpe = torch.bincount(topk.flatten(), minlength=E).to(torch.int32)
+        return topk, tpe
 
     if case.routing in {"balanced", "biased"}:
         bias = case.bias_ratio if case.routing == "biased" else 0.0
@@ -323,8 +339,18 @@ def assert_ulp_all_ranks(name, actual, expected, rank, R, max_ulps=1):
     )
 
 
-def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy, num_tokens=None):
+def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy,
+                              num_tokens=None, nvs_s=None):
+    """Structural checks on one rank's planning outputs.
+
+    ``num_tokens`` is this rank's ``s`` for the step (default ``case.S``);
+    ``nvs_s`` is ``plan.nvs_s``, the number of rows of this rank's NVL shard
+    dispatch may write this step. Only the local rank's ``nvs_s`` is known,
+    so the bound is checked on ``cu_seqlens[-1]`` and on every decoded local
+    offset whose destination is this rank; slots bound for other ranks are
+    only checked against the capacity ``NvS``."""
     errors = []
+    rank = int(ctx["rank"])
     R = int(ctx["R"])
     E = int(ctx["E"])
     B = int(ctx["B"])
@@ -335,6 +361,10 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy, num_t
     s = case.S if num_tokens is None else int(num_tokens)
     assert 0 < s <= case.S, f"num_tokens {s} outside [1, S={case.S}]"
     N = s * case.K  # this step's dst length
+    if nvs_s is not None:
+        nvs_s = int(nvs_s)
+        if not (0 < nvs_s <= NvS):
+            errors.append(f"nvs_s={nvs_s} outside (0, NvS={NvS}]")
 
     planning_out_elems = (
         3 * E * R
@@ -380,6 +410,14 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy, num_t
             errors.append("dst contains an out-of-range destination rank")
         if not torch.all((local_off >= 0) & (local_off < NvS)):
             errors.append("dst contains an out-of-range local offset")
+        if nvs_s is not None:
+            to_self = dest_rank == rank
+            if bool((local_off[to_self] >= nvs_s).any()):
+                worst = int(local_off[to_self].max().item())
+                errors.append(
+                    f"dst sends a slot to local offset {worst} >= nvs_s={nvs_s} "
+                    f"on rank {rank}"
+                )
 
     cu_cpu = cu_seqlens.cpu()
     if cu_seqlens.dtype != torch.int32 or tuple(cu_seqlens.shape) != (E + B,):
@@ -404,6 +442,10 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy, num_t
             prev = cur
         if int(cu_cpu[-1].item()) > NvS:
             errors.append(f"cu_seqlens total {int(cu_cpu[-1].item())} exceeds NvS={NvS}")
+        elif nvs_s is not None and int(cu_cpu[-1].item()) > nvs_s:
+            errors.append(
+                f"cu_seqlens total {int(cu_cpu[-1].item())} exceeds nvs_s={nvs_s}"
+            )
 
     copy_cpu = experts_to_copy.cpu()
     if experts_to_copy.dtype != torch.int32 or tuple(experts_to_copy.shape) != (R, B):

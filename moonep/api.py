@@ -1,16 +1,33 @@
 """
 MoonEP Top-level API.
 
-Notation: S = input tokens per rank, K = routed top-k per token, E = total routed
-experts in the EP group, R = number of EP ranks (EP comm size), B = weight
-prefetch slots per rank, NvS = dispatched token slots per rank (S*K real
-tokens plus per-VM-group padding), H = hidden size, H' = expert FFN
-intermediate size.
+Notation: S = token capacity per rank (max s per call), s = this rank's
+tokens in a given call (runtime, 1 <= s <= S), K = routed top-k per token,
+E = total routed experts in the EP group, R = number of EP ranks (EP comm
+size), B = weight prefetch slots per rank, NvS = dispatched token slot
+capacity per rank (S*K real tokens plus per-VM-group padding), nvs_s =
+``plan.nvs_s``, the prefix of the NvS shard that this step's dispatch may
+write (ceil(total_tokens*K / R) real slots plus per-VM-group padding),
+H = hidden size, H' = expert FFN intermediate size.
+
+Per-call tensors are sized by s / nvs_s, not by the capacities S / NvS:
+``dispatch`` takes ``[s, H]`` and returns ``[plan.nvs_s, H]``; ``combine``
+takes ``[plan.nvs_s, H]`` (or the full ``[NvS, H]`` shard) and returns
+``[s, H]``. Ranks may pass different s in the same step if every rank passes
+``total_num_tokens`` (the sum of all ranks' s); otherwise every rank must pass
+the same s, which the planning kernel verifies on device.
+
+CUDA graphs / torch.compile: the comm kernels take s as a runtime argument,
+but the returned view shapes depend on s (and, through nvs_s, on the sum of
+all ranks' s). Capture graphs per bucketed (s, total_num_tokens) pair and
+pad the input to the bucket; a graph captured at one s is not replayable at
+another.
 
 Usage:
     buffer = Buffer(S, H, K, E, num_ep_ranks, num_sms=None, token_padding=128)
 
-    # dispatch fwd
+    # dispatch fwd (hidden_sh is [s, H] for any 1 <= s <= S; pass
+    # total_num_tokens=sum of all ranks' s when ranks differ)
     hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
         hidden_sh, route_weights_sk, topk_experts_sk, tokens_per_expert,
     )
@@ -61,8 +78,9 @@ from .buffer import (
     get_vmm_granularity,
     get_multicast_granularity,
 )
-from .constants import DEDUP_BUILDER_WARPS
-from .planning import MoonEPCommPlan, allocate_planning_outputs, launch_planning
+from .planning import (
+    MoonEPCommPlan, allocate_planning_outputs, launch_planning, planning_recv_cap,
+)
 from .inter_rank_sync import launch_inter_rank_sync
 from .dispatch import launch_dispatch
 from .dispatch_epilogue import launch_dispatch_epilogue
@@ -128,6 +146,7 @@ def _log_context_buffer_size(ctx: dict) -> None:
         for name in (
             'alloc',
             'group_tokens',
+            'rank_tokens',
             'z',
             'local_hist',
             'grid_sync_bar',
@@ -375,6 +394,10 @@ def _create_context(
     # ================================================================
     alloc = torch.empty(E * R, dtype=torch.int32, device=dev)
     group_tokens = torch.empty(R, dtype=torch.int32, device=dev)
+    # Per-rank top-k entry counts (n_r = sum_e tpe_gather[r, e]) that rank 0's
+    # planning derives from the gathered tpe when ranks pass different s;
+    # zeroed in-kernel each step.
+    rank_tokens = torch.empty(R, dtype=torch.int32, device=dev)
     z = torch.empty(R * R, dtype=torch.int32, device=dev)
     local_hist = torch.empty(E * num_vblocks, dtype=torch.int32, device=dev)
     # Global arrive counter (1 int32) for the software grid barrier: the
@@ -420,6 +443,7 @@ def _create_context(
         'SRC_INFO_OFF': SRC_INFO_OFF,
         # Local temps
         'alloc': alloc, 'group_tokens': group_tokens,
+        'rank_tokens': rank_tokens,
         'z': z,
         'local_hist': local_hist,
         'grid_sync_bar': grid_sync_bar,
@@ -463,7 +487,8 @@ class Buffer:
         """Allocate and hold all communication buffers.
 
         Args:
-            S: input tokens per rank.
+            S: token capacity per rank (max s per call); every per-call
+                token count must satisfy 1 <= s <= S.
             H: hidden size.
             K: routed top-k per token.
             E: total routed experts in the EP group; must be divisible by
@@ -513,10 +538,12 @@ class Buffer:
 
     @property
     def hidden_nvsh_buffer_view(self) -> torch.Tensor:
-        """The local rank's [NvS, H] bf16 communication buffer.
+        """The local rank's full [NvS, H] bf16 communication buffer.
 
         Exposed for zero-copy integration: callers may write expert outputs
-        into this view and hand it back to ``combine(zero_copy=True)``. The
+        into this view and hand it back to ``combine(zero_copy=True)``.
+        ``dispatch(zero_copy=True)`` returns the ``[:plan.nvs_s]`` prefix of
+        this view; ``combine`` accepts either the prefix or the full view. The
         view aliases persistent comm state that every dispatch/combine on
         this Buffer overwrites — never let it (or any tensor sharing its
         storage) cross into autograd-saved state.
@@ -525,9 +552,11 @@ class Buffer:
 
     @property
     def router_weight_buffer_view(self) -> torch.Tensor:
-        """fp32 view of the local rank's [NvS] route-weights comm buffer.
+        """fp32 view of the local rank's full [NvS] route-weights comm buffer.
 
-        Same aliasing/lifetime rules as ``hidden_nvsh_buffer_view``.
+        Same aliasing/lifetime rules as ``hidden_nvsh_buffer_view``;
+        ``dispatch(router_weights_zero_copy=True)`` returns its
+        ``[:plan.nvs_s]`` prefix.
         """
         return self._require_ctx()['weights_buf_local'].view(torch.float32)
 
@@ -565,6 +594,7 @@ class Buffer:
             'hidden_buf',
             'alloc',
             'group_tokens',
+            'rank_tokens',
             'z',
             'local_hist',
             'grid_sync_bar',
@@ -627,13 +657,24 @@ class Buffer:
         inter_rank_sync: bool,
         zero_copy: bool,
         route_weights_zero_copy: bool,
+        total_num_tokens: int | None = None,
     ) -> None:
         if inter_rank_sync:
             launch_inter_rank_sync(ctx)
 
         if planning_args is not None:
+            # total_num_tokens (sum of all ranks' s this step, or None for
+            # uniform s) only matters here: plan reuse carries the caps the
+            # fresh planning computed.
             topk_flat, tokens_per_expert, cu_seqlens = planning_args
-            launch_planning(ctx, topk_flat, tokens_per_expert, cu_seqlens, plan)
+            launch_planning(
+                ctx,
+                topk_flat,
+                tokens_per_expert,
+                cu_seqlens=cu_seqlens,
+                plan=plan,
+                total_num_tokens=total_num_tokens,
+            )
 
         # Fresh planning publishes dst/src_info immediately before dispatch, so
         # dispatch can safely materialize the plan-owned dedup structures from
@@ -649,15 +690,19 @@ class Buffer:
             pdl_trigger=self.enable_pdl,
         )
         # In-place duplicate expansion on the NVL shard: after this the shard
-        # holds the full user-visible [NvS, H] layout.
+        # holds the user-visible VM-group layout; every slot written this step
+        # lies in the [plan.nvs_s, H] prefix (planner invariant).
         launch_dispatch_epilogue(ctx, plan, pdl_launch=self.enable_pdl)
         # master-style boundary copies (same stream, plain SM copies), gated
-        # independently per output tensor.
+        # independently per output tensor. Each copy covers exactly the rows
+        # of the returned view (a prefix of the shard), never the full NvS.
         if not zero_copy:
-            hidden_nvsh.copy_(ctx['hidden_buf_local'])
+            n_rows = int(hidden_nvsh.shape[0])
+            hidden_nvsh.copy_(ctx['hidden_buf_local'][:n_rows])
         if route_weights_nvs is not None and not route_weights_zero_copy:
+            n_rows = int(route_weights_nvs.shape[0])
             route_weights_nvs.copy_(
-                ctx['weights_buf_local'].view(torch.float32)
+                ctx['weights_buf_local'][:n_rows].view(torch.float32)
             )
 
     def _run_combine_on_current_stream(
@@ -678,11 +723,15 @@ class Buffer:
         if inter_rank_sync:
             launch_inter_rank_sync(ctx)
         # master-style boundary copies into the shard (same stream), gated
-        # independently per input tensor.
+        # independently per input tensor. The inputs are either the
+        # [plan.nvs_s, ...] prefix views dispatch returned or the full NvS
+        # shard layout; copy exactly their row count into the shard prefix.
         if not zero_copy:
-            ctx['hidden_buf_local'].copy_(hidden_nvsh)
+            n_rows = int(hidden_nvsh.shape[0])
+            ctx['hidden_buf_local'][:n_rows].copy_(hidden_nvsh)
         if route_weights_nvs is not None and not router_weights_zero_copy:
-            ctx['weights_buf_local'].copy_(
+            n_rows = int(route_weights_nvs.shape[0])
+            ctx['weights_buf_local'][:n_rows].copy_(
                 route_weights_nvs.view(torch.int32)
             )
         # In-place fp32 accumulation of duplicate rows into their primary.
@@ -729,20 +778,23 @@ class Buffer:
         inter_rank_sync: bool = True,
         zero_copy: bool = False,
         router_weights_zero_copy: bool = False,
+        total_num_tokens: int | None = None,
     ):
         """dispatch fwd: run planning (unless reusing a plan) and scatter tokens
         to their expert-grouped positions on remote ranks.
 
         Args:
-            hidden_sh: [s, H] bf16 input tokens, for any 1 <= s <= S (the 
-                capacity the Buffer was constructed with). Every rank must pass 
-                the same s in a given step.
+            hidden_sh: [s, H] bf16 input tokens, for any 1 <= s <= S (the
+                capacity the Buffer was constructed with). Ranks may pass
+                different s in the same step only when every rank also passes
+                ``total_num_tokens``; otherwise all ranks must pass the same s
+                (verified on device by the planning kernel).
             route_weights_sk: [s, K] fp32 routing weights; None skips the
                 weights buffer entirely.
             topk_experts_sk: [s, K] int32 expert ids; required when ``plan``
                 is None.
-            tokens_per_expert: [E] int32 local token count per expert;
-                required when ``plan`` is None.
+            tokens_per_expert: [E] int32 contiguous local token count per
+                expert; required when ``plan`` is None.
             plan: saved MoonEPCommPlan to reuse — planning is skipped and
                 ``topk_experts_sk`` / ``tokens_per_expert`` are ignored. This
                 is the combine bwd path: re-dispatching ``grad_output_sh``
@@ -767,64 +819,149 @@ class Buffer:
                 saved into autograd state by training frameworks), so callers
                 that only consume it before the next dispatch — e.g.
                 inference — opt in explicitly.
+            total_num_tokens: sum over all EP ranks of this step's s. It is
+                host-known (from the dataloader, or one all_gather of ints)
+                and must be identical on every rank. None means every rank
+                passes the same s (the planning kernel traps on device if
+                not). Only consulted on the fresh-planning path; ignored when
+                ``plan`` is given because the saved plan already carries the
+                receive caps the fresh planning computed.
 
         Returns:
             ``(hidden_nvsh, route_weights_nvs, cu_seqlens, plan)``, plus a
             comm-stream CUDA event when ``async_finish=True``:
 
-            - hidden_nvsh: [NvS, H] bf16 dispatched tokens in physical VM
-              group order.
-            - route_weights_nvs: [NvS] fp32, or None when ``route_weights_sk``
-              is None.
+            - hidden_nvsh: [plan.nvs_s, H] bf16 dispatched tokens in physical
+              VM group order. ``plan.nvs_s = ceil(total_num_tokens*K / R) +
+              token_padding_extra`` is the number of rows of this rank's NvS
+              shard that this step's dispatch may write (the receive cap plus
+              the worst-case per-VM-group padding); every ``cu_seqlens``
+              segment ends at or before it. It is independent of this rank's
+              own s. The returned tensor is the shard prefix (zero_copy) or a
+              fresh copy of it, never the full [NvS, H] shard.
+            - route_weights_nvs: [plan.nvs_s] fp32, or None when
+              ``route_weights_sk`` is None.
             - cu_seqlens: [E+B] int32 padded token end offset per VM group
               row; None on the plan-reuse path.
             - plan: MoonEPCommPlan; save it for prefetch/combine and both
               backward passes.
         """
         ctx = self._require_ctx()
+        S = int(ctx['S'])
+        K = int(ctx['K'])
+        E = int(ctx['E'])
+        R = int(ctx['R'])
+        H = int(ctx['H'])
 
-        # Runtime token count for this step: any 1 <= s <= S (the capacity the 
+        # Runtime token count for this step: any 1 <= s <= S (the capacity the
         # Buffer was built with). Kernels loop to s; layouts stay at S.
         assert hidden_sh.ndim == 2, \
             f"hidden_sh must be [s, H], got {tuple(hidden_sh.shape)}"
         num_tokens = int(hidden_sh.shape[0])
-        assert 0 < num_tokens <= int(ctx['S']), (
-            f"hidden_sh has {num_tokens} tokens; Buffer capacity S={int(ctx['S'])}"
+        assert 0 < num_tokens <= S, (
+            f"hidden_sh has {num_tokens} tokens; Buffer capacity S={S}"
         )
+        # The dispatch kernel reads hidden_sh rows with cp.async.bulk from an
+        # assumed_align=16 pointer. Row slices of a [S, H] bf16 tensor keep
+        # 16-byte alignment (H % 8 == 0), but arbitrary views may not:
+        # re-materialize those in a fresh allocation like the other inputs.
+        if not hidden_sh.is_contiguous() or hidden_sh.data_ptr() % 16 != 0:
+            hidden_sh = hidden_sh.clone(memory_format=torch.contiguous_format)
+        if route_weights_sk is not None:
+            assert route_weights_sk.dtype == torch.float32, (
+                f"route_weights_sk must be fp32, got {route_weights_sk.dtype}"
+            )
+            assert tuple(route_weights_sk.shape) == (num_tokens, K), (
+                f"route_weights_sk must be [s={num_tokens}, K={K}] "
+                f"(same s as hidden_sh), got {tuple(route_weights_sk.shape)}"
+            )
+            # The dispatch kernel takes the weights pointer with
+            # assumed_align=16. A mid-batch slice of a larger [S, K] tensor
+            # (e.g. rows [a:b] with a*K*4 % 16 != 0) is contiguous but not
+            # 16-byte aligned, so re-materialize it in a fresh allocation.
+            if not route_weights_sk.is_contiguous() or \
+                    route_weights_sk.data_ptr() % 16 != 0:
+                route_weights_sk = route_weights_sk.clone(
+                    memory_format=torch.contiguous_format)
 
         if plan is None:
-            assert topk_experts_sk is not None and tokens_per_expert is not None
+            assert topk_experts_sk is not None and tokens_per_expert is not None, (
+                "dispatch without a plan requires topk_experts_sk and "
+                "tokens_per_expert"
+            )
+            assert topk_experts_sk.dtype == torch.int32, (
+                f"topk_experts_sk must be int32, got {topk_experts_sk.dtype}"
+            )
+            assert tuple(topk_experts_sk.shape) == (num_tokens, K), (
+                f"topk_experts_sk must be [s={num_tokens}, K={K}] "
+                f"(same s as hidden_sh), got {tuple(topk_experts_sk.shape)}"
+            )
             topk_flat = topk_experts_sk.reshape(-1)
-            assert topk_flat.dtype == torch.int32 and \
-                topk_flat.numel() == num_tokens * int(ctx['K']), (
-                    f"topk_experts_sk must be [s={num_tokens}, K={int(ctx['K'])}], "
-                    f"got {tuple(topk_experts_sk.shape)}"
+            # Same assumed_align=16 contract as route_weights_sk above: a
+            # mid-batch row slice of a bigger topk tensor may be misaligned.
+            if not topk_flat.is_contiguous() or topk_flat.data_ptr() % 16 != 0:
+                topk_flat = topk_flat.clone(memory_format=torch.contiguous_format)
+            assert tokens_per_expert.dtype == torch.int32, (
+                f"tokens_per_expert must be int32, got {tokens_per_expert.dtype}"
+            )
+            assert tuple(tokens_per_expert.shape) == (E,) and \
+                tokens_per_expert.is_contiguous(), (
+                    f"tokens_per_expert must be contiguous int32 [E={E}], "
+                    f"got {tuple(tokens_per_expert.shape)}"
                 )
-            assert tokens_per_expert.dtype == torch.int32
-            assert tokens_per_expert.numel() == int(ctx['E']) and tokens_per_expert.is_contiguous()
-            plan, cu_seqlens = allocate_planning_outputs(ctx, num_tokens)
+            if total_num_tokens is not None:
+                total_num_tokens = int(total_num_tokens)
+                assert num_tokens <= total_num_tokens <= R * S, (
+                    f"total_num_tokens={total_num_tokens} must be the sum of all "
+                    f"{R} ranks' s this step: in [s={num_tokens}, R*S={R * S}]"
+                )
+            # plan.nvs_s (receive cap + padding extra) is derived from
+            # total_num_tokens (R*s when None) inside allocate_planning_outputs.
+            plan, cu_seqlens = allocate_planning_outputs(
+                ctx, num_tokens, total_num_tokens
+            )
             planning_args = (topk_flat, tokens_per_expert, cu_seqlens)
         else:
+            # Plan reuse (combine bwd): planning is skipped, so
+            # total_num_tokens is ignored; the plan carries nvs_s from the
+            # fresh planning that produced it.
             cu_seqlens = None
             planning_args = None
             assert isinstance(plan, MoonEPCommPlan)
+            if total_num_tokens is not None:
+                expected_nvs_s = planning_recv_cap(ctx, int(total_num_tokens)) + \
+                    int(ctx['token_padding_extra'])
+                assert expected_nvs_s == int(plan.nvs_s), (
+                    f"total_num_tokens={int(total_num_tokens)} implies nvs_s="
+                    f"{expected_nvs_s}, but the reused plan has nvs_s={plan.nvs_s}; "
+                    "reuse a plan only with the step it was planned for"
+                )
             assert plan.num_tokens == num_tokens, (
                 f"plan was made for {plan.num_tokens} tokens, "
                 f"hidden_sh has {num_tokens}"
             )
-            
 
+        # Returned views cover the [plan.nvs_s] shard prefix that this step's
+        # dispatch may write, not the full NvS capacity (spec 6.2).
+        nvs_s = int(plan.nvs_s)
+        assert 0 < nvs_s <= int(ctx['NvS']), (
+            f"plan.nvs_s={nvs_s} must be in [1, NvS={int(ctx['NvS'])}]"
+        )
         if zero_copy:
-            hidden_nvsh = ctx['hidden_buf_local']
+            hidden_nvsh = ctx['hidden_buf_local'][:nvs_s]
         else:
-            hidden_nvsh = torch.empty_like(ctx['hidden_buf_local'])
+            hidden_nvsh = torch.empty(
+                (nvs_s, H),
+                dtype=torch.bfloat16,
+                device=ctx['hidden_buf_local'].device,
+            )
         if route_weights_sk is None:
             route_weights_nvs = None
         elif router_weights_zero_copy:
-            route_weights_nvs = ctx['weights_buf_local'].view(torch.float32)
+            route_weights_nvs = ctx['weights_buf_local'][:nvs_s].view(torch.float32)
         else:
             route_weights_nvs = torch.empty(
-                ctx['NvS'], dtype=torch.float32, device=ctx['meta_buf'].device
+                nvs_s, dtype=torch.float32, device=ctx['meta_buf'].device
             )
 
         if not async_finish:
@@ -839,6 +976,7 @@ class Buffer:
                 inter_rank_sync=inter_rank_sync,
                 zero_copy=zero_copy,
                 route_weights_zero_copy=router_weights_zero_copy,
+                total_num_tokens=total_num_tokens,
             )
             return hidden_nvsh, route_weights_nvs, cu_seqlens, plan
 
@@ -872,6 +1010,7 @@ class Buffer:
                 inter_rank_sync=inter_rank_sync,
                 zero_copy=zero_copy,
                 route_weights_zero_copy=router_weights_zero_copy,
+                total_num_tokens=total_num_tokens,
             )
             done = comm.record_event()
 
@@ -979,18 +1118,20 @@ class Buffer:
         router_weights_zero_copy: bool = False,
     ):
         """combine fwd: gather expert outputs from the NVL buffer and K-sum
-        back to token-major [S, H].
+        back to token-major [s, H] with ``s = plan.num_tokens``.
 
         Also serves as dispatch bwd: combining ``grad_hidden_nvsh`` sums each
         token's K dispatched grad copies back to its token-major grad.
 
         Args:
             plan: MoonEPCommPlan returned by ``dispatch``.
-            hidden_nvsh: [NvS, H] bf16 expert outputs in physical VM group
-                order.
-            route_weights_nvs: [NvS] fp32, optional; pass the
-                dispatch-returned weights to also gather them back to
-                token-major.
+            hidden_nvsh: [plan.nvs_s, H] bf16 expert outputs in physical VM
+                group order — the layout ``dispatch`` returned. The full
+                [NvS, H] shard layout is also accepted (rows past
+                ``plan.nvs_s`` are copied but never read).
+            route_weights_nvs: [plan.nvs_s] fp32 (or the full [NvS]),
+                optional; pass the dispatch-returned weights to also gather
+                them back to token-major.
             async_finish: run on the comm stream and return a CUDA event.
             inter_rank_sync: run a CuTe DSL rank sync before staging
                 (default True).
@@ -1018,14 +1159,35 @@ class Buffer:
 
         assert isinstance(plan, MoonEPCommPlan), "Buffer.combine: plan is required"
 
-        assert hidden_nvsh is not None
-        assert hidden_nvsh.dtype == torch.bfloat16
-        assert hidden_nvsh.is_contiguous()
-        assert tuple(hidden_nvsh.shape) == (int(ctx['NvS']), int(ctx['H']))
+        NvS = int(ctx['NvS'])
+        H = int(ctx['H'])
+        nvs_s = int(plan.nvs_s)
+        assert 0 < nvs_s <= NvS, (
+            f"plan.nvs_s={nvs_s} must be in [1, NvS={NvS}]"
+        )
+        assert hidden_nvsh is not None, "Buffer.combine: hidden_nvsh is required"
+        assert hidden_nvsh.dtype == torch.bfloat16, (
+            f"hidden_nvsh must be bf16, got {hidden_nvsh.dtype}"
+        )
+        assert hidden_nvsh.is_contiguous(), "hidden_nvsh must be contiguous"
+        assert hidden_nvsh.ndim == 2 and int(hidden_nvsh.shape[1]) == H and \
+            int(hidden_nvsh.shape[0]) in (NvS, nvs_s), (
+                "hidden_nvsh must be the dispatch-returned layout "
+                f"[plan.nvs_s={nvs_s}, H={H}] (or the full [NvS={NvS}, H] shard), "
+                f"got {tuple(hidden_nvsh.shape)}"
+            )
         if route_weights_nvs is not None:
-            assert route_weights_nvs.dtype == torch.float32
-            assert route_weights_nvs.is_contiguous()
-            assert tuple(route_weights_nvs.shape) == (int(ctx['NvS']),)
+            assert route_weights_nvs.dtype == torch.float32, (
+                f"route_weights_nvs must be fp32, got {route_weights_nvs.dtype}"
+            )
+            assert route_weights_nvs.is_contiguous(), \
+                "route_weights_nvs must be contiguous"
+            assert route_weights_nvs.ndim == 1 and \
+                int(route_weights_nvs.shape[0]) in (NvS, nvs_s), (
+                    "route_weights_nvs must be the dispatch-returned layout "
+                    f"[plan.nvs_s={nvs_s}] (or the full [NvS={NvS}] shard), "
+                    f"got {tuple(route_weights_nvs.shape)}"
+                )
         if zero_copy:
             assert hidden_nvsh.data_ptr() == ctx['hidden_buf_local'].data_ptr(), (
                 "combine(zero_copy=True): hidden_nvsh must alias the NVL shard "
@@ -1041,7 +1203,7 @@ class Buffer:
 
         hidden_sh = torch.empty(
             plan.num_tokens,
-            int(ctx['H']),
+            H,
             dtype=hidden_nvsh.dtype,
             device=hidden_nvsh.device,
         )

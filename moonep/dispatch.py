@@ -147,10 +147,10 @@ class DispatchKernel:
     @cute.jit
     def __call__(
         self,
-        hidden_sh_ptr: cute.Pointer,          # bf16 [S, H]
+        hidden_sh_ptr: cute.Pointer,          # bf16 [s, H]; s = num_tokens <= S (layout declared at capacity S)
         hidden_buf_ptr: cute.Pointer,         # bf16 [R*NvS_padded, H]
-        weights_ptr: cute.Pointer,            # int32 view of fp32 [S, K] (or placeholder)
-        dst_ptr: cute.Pointer,                # int32 [N=S*K]
+        weights_ptr: cute.Pointer,            # int32 view of fp32 [s, K] (or placeholder)
+        dst_ptr: cute.Pointer,                # int32 [N=s*K]
         meta_ptr: cute.Pointer,               # int32 [R*meta_stride]
         zero_fill_ranges_ptr: cute.Pointer,   # int32 [E+B, 2] (col0=pad_start, col1=n_pad)
         bar_ptr: cute.Pointer,                # int32 [1] grid barrier counter
@@ -164,7 +164,7 @@ class DispatchKernel:
         rank: Int32,
         weights_off: Int32,
         barrier_off: Int32,
-        num_tokens: Int32,
+        num_tokens: Int32,                    # this step's tokens on this rank (s), 1 <= s <= S
         stream: cuda.CUstream,
     ):
         H = cutlass.const_expr(self.H)
@@ -196,7 +196,9 @@ class DispatchKernel:
         meta_tensor = cute.make_tensor(
             meta_ptr, cute.make_layout((R * meta_stride,))
         )
-        # weights: int32 view of fp32 [S, K] when with_weights, else placeholder.
+        # weights: int32 view of fp32 [s, K] when with_weights, else placeholder.
+        # The layout is declared at capacity S*K; only the first s*K entries
+        # are ever indexed (per-block token ranges stop at num_tokens).
         if cutlass.const_expr(self.with_weights):
             w_tensor = cute.make_tensor(
                 weights_ptr, cute.make_layout((S * K,))
@@ -830,7 +832,6 @@ def _check_dedup_builder_tensors(ctx: dict, dev: torch.device) -> None:
     R = int(ctx['R'])
     S = int(ctx['S'])
     K = int(ctx['K'])
-    NvS = int(ctx['NvS'])
 
     def _check_scratch(name: str, numel: int) -> None:
         assert name in ctx, f"ctx missing {name}"
@@ -896,7 +897,14 @@ def launch_dispatch(
     assert hidden_sh.dtype == torch.bfloat16 and hidden_sh.is_contiguous(), \
         "hidden_sh must be contiguous bf16"
     assert hidden_sh.is_cuda, "hidden_sh must be a CUDA tensor"
-    
+    # cp.async.bulk rows and the assumed_align=16 pointer both need a 16-byte
+    # aligned base (rows are 16-byte multiples because H % 8 == 0).
+    assert hidden_sh.data_ptr() % 16 == 0, (
+        "hidden_sh must be 16-byte aligned (the dispatch kernel uses "
+        "assumed_align=16 / cp.async.bulk); re-materialize mid-batch slices "
+        "with .contiguous().clone()"
+    )
+
     assert hidden_sh.ndim == 2 and int(hidden_sh.shape[1]) == H \
         and 0 < int(hidden_sh.shape[0]) <= S, \
             f"hidden_sh must be shape [s, H={H}] with 1 <= s <= {S}, got {tuple(hidden_sh.shape)}"
@@ -916,6 +924,14 @@ def launch_dispatch(
         assert tuple(route_weights_sk.shape) == (num_tokens, K), \
             f"route_weights_sk must be shape [s={num_tokens}, K={K}], got {tuple(route_weights_sk.shape)}"
         assert route_weights_sk.device == hidden_sh.device
+        # The kernel binds this pointer with assumed_align=16 and issues
+        # vectorized int32 loads; a mid-batch [a:b] row slice of a larger
+        # [S, K] tensor can be contiguous yet only 4-byte aligned.
+        assert route_weights_sk.data_ptr() % 16 == 0, (
+            "route_weights_sk must be 16-byte aligned (the dispatch kernel uses "
+            "assumed_align=16); Buffer.dispatch re-materializes misaligned "
+            "slices, direct callers must pass .contiguous().clone()"
+        )
     assert ctx['H'] % 8 == 0, "H must be multiple of 8 for 16-B bulk-copy alignment"
     if build_dedup_map:
         _check_dedup_builder_bounds(ctx)

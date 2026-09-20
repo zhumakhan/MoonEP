@@ -2,6 +2,10 @@
 
 Run with:
     torchrun --nproc_per_node=8 -m pytest -s tests/test_dispatch.py
+
+Every scatter test also runs at partial step sizes ``s < S``: the Buffer's S
+is a capacity, each step routes ``s`` tokens (the same ``s`` on every rank in
+these tests) and the plan is sized ``s*K``.
 """
 
 from dataclasses import replace
@@ -20,6 +24,7 @@ from tests.kernel_test_utils import (
     gather_tensor,
     init_case,
     make_topk,
+    partial_token_counts,
 )
 from tests.planning_reference import launch_planning_torch_reference
 
@@ -96,6 +101,34 @@ DISPATCH_CASES = [
     ),
 ]
 
+# Extra shapes for the partial-s sweep: K=1 (direct scatter, no dedup) and an
+# odd K, both with a real capacity to shrink from.
+PARTIAL_DISPATCH_CASES = DISPATCH_CASES + [
+    KernelCase("k1_partial", S=32, K=1, epn=4, H=64, num_sms=8, B=1, token_padding=8),
+    KernelCase(
+        "odd_k3_partial",
+        S=40,
+        K=3,
+        epn=8,
+        H=64,
+        num_sms=8,
+        B=2,
+        token_padding=16,
+    ),
+    KernelCase(
+        "odd_k5_duplicate_topk_partial",
+        S=24,
+        K=5,
+        epn=4,
+        H=64,
+        num_sms=8,
+        B=2,
+        token_padding=8,
+        routing="duplicate_topk",
+        min_R=2,
+    ),
+]
+
 ZERO_FILL_CASES = [
     KernelCase(
         "local_padding",
@@ -134,21 +167,45 @@ LARGE_DISPATCH_CASES = [
     )
 ]
 
+SAVED_PLAN_CASE = KernelCase(
+    "saved_plan",
+    S=17,
+    K=3,
+    epn=8,
+    H=64,
+    num_sms=8,
+    B=2,
+    token_padding=16,
+    routing="all_remote",
+    min_R=2,
+)
 
-def _traceable_hidden(rank, S, H):
-    hidden = torch.zeros(S, H, dtype=torch.bfloat16, device="cuda")
+
+def _step_tokens(case, s):
+    s = case.S if s is None else int(s)
+    assert 0 < s <= case.S, f"num_tokens {s} outside [1, S={case.S}]"
+    return s
+
+
+def _traceable_hidden(rank, s, H):
+    """[s, H] bf16 whose first two i16 lanes encode (token index, source rank)."""
+    hidden = torch.zeros(s, H, dtype=torch.bfloat16, device="cuda")
     hidden_i16 = hidden.view(torch.int16)
-    s_idx = torch.arange(S, dtype=torch.int32, device="cuda")
+    s_idx = torch.arange(s, dtype=torch.int32, device="cuda")
     hidden_i16[:, 0] = s_idx.to(torch.int16)
     if H > 1:
-        hidden_i16[:, 1] = torch.full((S,), rank, dtype=torch.int16, device="cuda")
+        hidden_i16[:, 1] = torch.full((s,), rank, dtype=torch.int16, device="cuda")
     return hidden
 
 
-def _traceable_weights(rank, S, K):
+def _traceable_weights(rank, S, K, s=None):
+    """[s, K] fp32 bit patterns ``rank*S*K + token*K + k``. The stride stays
+    the capacity ``S*K`` for every ``s`` so ``_verify_dispatch_by_dst`` decodes
+    (rank, token, k) unambiguously from the value alone."""
+    s = S if s is None else int(s)
     weights_i32 = (
-        torch.arange(S * K, dtype=torch.int32, device="cuda")
-        .reshape(S, K)
+        torch.arange(s * K, dtype=torch.int32, device="cuda")
+        .reshape(s, K)
         .add_(rank * S * K)
     )
     return weights_i32.view(torch.float32)
@@ -164,27 +221,35 @@ def _plan_and_dispatch(
     *,
     hidden_user=None,
     weights_user=None,
+    s=None,
 ):
+    """Plan ``s`` tokens (default ``case.S``), run the fresh dispatch builder,
+    the in-place duplicate expansion and the zero_copy=False style boundary
+    copies. Returns ``(dst, plan, hidden_user, weights_user)``; the user
+    tensors are full ``[NvS, ...]`` copies of this rank's shard."""
     from moonep.dispatch import launch_dispatch
     from moonep.dispatch_epilogue import launch_dispatch_epilogue
     from moonep.planning import allocate_planning_outputs, launch_planning
 
-    topk, tpe = make_topk(case, rank, R)
-    plan, _cu = allocate_planning_outputs(ctx)
-    launch_planning(ctx, topk.reshape(-1).contiguous(), tpe, _cu, plan)
+    s = _step_tokens(case, s)
+    assert int(hidden.shape[0]) == s, f"hidden has {hidden.shape[0]} rows, expected s={s}"
+    topk, tpe = make_topk(case, rank, R, s=s)
+    plan, _cu = allocate_planning_outputs(ctx, s)
+    assert plan.num_tokens == s and plan.N == s * case.K
+    launch_planning(ctx, topk.reshape(-1).contiguous(), tpe, plan=plan, cu_seqlens=_cu)
     _ref_dst, _ref_cu, _ref_etc, _ref_stats, _ref_zfr, ref_dedup_plan = (
         launch_planning_torch_reference(ctx, topk, tpe)
     )
     launch_dispatch(ctx, hidden, weights, plan, build_dedup_map=True)
     assert_dedup_plan_semantic_equal_all_ranks(
-        "dispatch dedup plan", plan, ref_dedup_plan, rank, R
+        f"dispatch dedup plan[s={s}]", plan, ref_dedup_plan, rank, R
     )
     dedup_errors = dedup_plan_invariant_errors(case, ctx, plan)
     assert_all_ranks(
         not dedup_errors,
         rank,
         R,
-        f"{case.name} dispatch dedup plan invariants",
+        f"{case.name} [s={s}] dispatch dedup plan invariants",
         "; ".join(dedup_errors[:5]),
     )
     # In-place duplicate expansion on the NVL shard, then the master-style
@@ -208,9 +273,12 @@ def _plan_and_dispatch(
 
 def _verify_dispatch_by_dst(ctx, case, rank, R, dst, hidden_user,
                             check_weights=True, weights_user=None,
-                            max_checks=None, copy_to_cpu=True):
+                            max_checks=None, copy_to_cpu=True, s=None):
+    """Decode every (src_rank, token, k) slot that lands on this rank from the
+    gathered ``dst`` and check the traceable payload at its local offset."""
+    s = _step_tokens(case, s)
     nvs_stride = int(ctx["NvS"])
-    all_dst = gather_tensor(dst.reshape(case.S, case.K).contiguous(), R).cpu()
+    all_dst = gather_tensor(dst.reshape(s, case.K).contiguous(), R).cpu()
 
     if copy_to_cpu:
         hidden_i16 = hidden_user.view(torch.int16).cpu()
@@ -222,23 +290,23 @@ def _verify_dispatch_by_dst(ctx, case, rank, R, dst, hidden_user,
     errors = []
     checked = 0
     for src_r in range(R):
-        for s in range(case.S):
+        for tok in range(s):
             for k in range(case.K):
-                dst_val = int(all_dst[src_r, s, k].item())
+                dst_val = int(all_dst[src_r, tok, k].item())
                 raw_dst = -dst_val - 1 if dst_val < 0 else dst_val
                 dest_rank = raw_dst // nvs_stride
                 local_off = raw_dst % nvs_stride
                 if dest_rank != rank:
                     continue
 
-                expected_s = s & 0xFFFF
+                expected_s = tok & 0xFFFF
                 if expected_s >= 0x8000:
                     expected_s -= 0x10000
                 actual_s = int(hidden_i16[local_off, 0].item())
                 actual_r = int(hidden_i16[local_off, 1].item()) if case.H > 1 else src_r
                 if actual_s != expected_s or actual_r != src_r:
                     errors.append(
-                        f"hidden src=({src_r},{s},{k}) loff={local_off}: "
+                        f"hidden src=({src_r},{tok},{k}) loff={local_off}: "
                         f"expected s/r={expected_s}/{src_r}, got {actual_s}/{actual_r}"
                     )
 
@@ -246,11 +314,11 @@ def _verify_dispatch_by_dst(ctx, case, rank, R, dst, hidden_user,
                     if weights_i32 is None:
                         errors.append("weights_user missing while check_weights=True")
                         continue
-                    expected_w = src_r * case.S * case.K + s * case.K + k
+                    expected_w = src_r * case.S * case.K + tok * case.K + k
                     actual_w = int(weights_i32[local_off].item())
                     if actual_w != expected_w:
                         errors.append(
-                            f"weight src=({src_r},{s},{k}) loff={local_off}: "
+                            f"weight src=({src_r},{tok},{k}) loff={local_off}: "
                             f"expected {expected_w}, got {actual_w}"
                         )
 
@@ -287,37 +355,61 @@ def _zero_row_errors(zero_fill_ranges, hidden_user, weights_user=None):
     return errors, rows
 
 
-@pytest.mark.parametrize("case", case_params(DISPATCH_CASES))
-def test_dispatch_scatters_hidden_and_weights_by_dst(dist_env, case):
-    rank, R = dist_env
-    ctx = init_case(case, R)
-    hidden = _traceable_hidden(rank, case.S, case.H)
-    weights = _traceable_weights(rank, case.S, case.K)
+def _check_scatter(ctx, case, rank, R, s, with_weights, label):
+    """One traceable dispatch at ``s`` tokens (weights optional), verified
+    slot by slot against the gathered ``dst``."""
+    hidden = _traceable_hidden(rank, s, case.H)
+    weights = _traceable_weights(rank, case.S, case.K, s=s) if with_weights else None
 
-    dst, _plan, hidden_user, weights_user = _plan_and_dispatch(
-        ctx, case, rank, R, hidden, weights
+    dst, plan, hidden_user, weights_user = _plan_and_dispatch(
+        ctx, case, rank, R, hidden, weights, s=s
     )
     torch.cuda.synchronize()
+    assert tuple(dst.shape) == (s * case.K,), f"dst shape {tuple(dst.shape)}"
 
     errors, checked = _verify_dispatch_by_dst(
-        ctx, case, rank, R, dst, hidden_user=hidden_user, weights_user=weights_user
+        ctx, case, rank, R, dst, hidden_user=hidden_user,
+        check_weights=with_weights, weights_user=weights_user, s=s,
     )
+    if weights is None and weights_user is not None:
+        errors.append("hidden-only dispatch returned a weights buffer")
     assert_all_ranks(
         checked > 0 and not errors,
         rank,
         R,
-        f"{case.name} dispatch scatter",
+        f"{case.name} {label}",
         "; ".join(errors[:5]) or f"checked={checked}",
     )
+    return plan
 
 
-@pytest.mark.parametrize("case", case_params(ZERO_FILL_CASES))
-def test_dispatch_dedup_plan_clears_padding_with_weights(dist_env, case):
+@pytest.mark.parametrize("case", case_params(DISPATCH_CASES))
+def test_dispatch_scatters_hidden_and_weights_by_dst(dist_env, case):
     rank, R = dist_env
     ctx = init_case(case, R)
-    hidden = torch.randn(case.S, case.H, dtype=torch.bfloat16, device="cuda")
-    weights = torch.rand(case.S, case.K, dtype=torch.float32, device="cuda")
+    _check_scatter(ctx, case, rank, R, case.S, True, "dispatch scatter")
 
+
+@pytest.mark.parametrize("with_weights", [True, False], ids=["weights", "hidden_only"])
+@pytest.mark.parametrize("case", case_params(PARTIAL_DISPATCH_CASES))
+def test_dispatch_partial_tokens_scatters_by_dst(dist_env, case, with_weights):
+    """Fresh plan + dispatch at s in {1, S//2, S-1} on one Buffer of capacity
+    S, with and without the weights scatter; every slot of every rank's
+    ``s*K`` entries is checked (dedup, K=1 and odd-K cases included)."""
+    rank, R = dist_env
+    if case.S < 2:
+        pytest.skip("partial-token dispatch needs S >= 2")
+    ctx = init_case(case, R)
+    for s in partial_token_counts(case.S):
+        label = f"[s={s}/{case.S}] {'weights' if with_weights else 'hidden-only'} scatter"
+        _check_scatter(ctx, case, rank, R, s, with_weights, label)
+
+
+def _check_padding_zero_fill(ctx, case, rank, R, s):
+    hidden = torch.randn(s, case.H, dtype=torch.bfloat16, device="cuda")
+    weights = torch.rand(s, case.K, dtype=torch.float32, device="cuda")
+
+    # Poison the shard and the user copies so a skipped zero fill is visible.
     ctx["hidden_buf_local"].fill_(7)
     ctx["weights_buf_local"].fill_(0x55555555)
     hidden_user = torch.empty(
@@ -343,6 +435,7 @@ def test_dispatch_dedup_plan_clears_padding_with_weights(dist_env, case):
         weights,
         hidden_user=hidden_user,
         weights_user=weights_user,
+        s=s,
     )
     torch.cuda.synchronize()
 
@@ -351,48 +444,58 @@ def test_dispatch_dedup_plan_clears_padding_with_weights(dist_env, case):
         rows > 0 and not errors,
         rank,
         R,
-        f"{case.name} dispatch padding zero-fill",
+        f"{case.name} [s={s}/{case.S}] dispatch padding zero-fill",
         "; ".join(errors[:5]) or f"padding_rows={rows}",
     )
 
 
-def test_dispatch_saved_plan_hidden_only_reuses_dst_and_skips_weights(dist_env):
+@pytest.mark.parametrize("case", case_params(ZERO_FILL_CASES))
+def test_dispatch_dedup_plan_clears_padding_with_weights(dist_env, case):
+    rank, R = dist_env
+    ctx = init_case(case, R)
+    _check_padding_zero_fill(ctx, case, rank, R, case.S)
+
+
+@pytest.mark.parametrize("case", case_params(ZERO_FILL_CASES))
+def test_dispatch_partial_tokens_clears_padding_with_weights(dist_env, case):
+    """Segment padding rows are zero-filled at every partial s too (S=17,
+    K=3, token_padding=16 leaves padding in every group at each s)."""
+    rank, R = dist_env
+    ctx = init_case(case, R)
+    for s in partial_token_counts(case.S):
+        _check_padding_zero_fill(ctx, case, rank, R, s)
+
+
+def _check_saved_plan_hidden_only(ctx, case, rank, R, s):
+    """Plan A (all_remote) at ``s`` tokens, then an unrelated plan B on the
+    same Buffer, then re-dispatch hidden A with the saved plan A
+    (``build_dedup_map=False``, no weights): the scatter must match plan A's
+    dst, padding stays zero, the weights shard and A's dedup structures are
+    untouched."""
     from moonep.dispatch import launch_dispatch
     from moonep.dispatch_epilogue import launch_dispatch_epilogue
     from moonep.planning import allocate_planning_outputs, launch_planning
 
-    rank, R = dist_env
-    case = KernelCase(
-        "saved_plan",
-        S=17,
-        K=3,
-        epn=8,
-        H=64,
-        num_sms=8,
-        B=2,
-        token_padding=16,
-        routing="all_remote",
-        min_R=2,
-    )
-    ctx = init_case(case, R)
-
-    hidden_a = _traceable_hidden(rank, case.S, case.H)
-    weights_a = _traceable_weights(rank, case.S, case.K)
-    topk_a, tpe_a = make_topk(case, rank, R)
-    plan_a, _cu = allocate_planning_outputs(ctx)
-    launch_planning(ctx, topk_a.reshape(-1).contiguous(), tpe_a, _cu, plan_a)
+    hidden_a = _traceable_hidden(rank, s, case.H)
+    weights_a = _traceable_weights(rank, case.S, case.K, s=s)
+    topk_a, tpe_a = make_topk(case, rank, R, s=s)
+    plan_a, _cu = allocate_planning_outputs(ctx, s)
+    launch_planning(ctx, topk_a.reshape(-1).contiguous(), tpe_a, plan=plan_a, cu_seqlens=_cu)
     dst_a = plan_a.dst
     launch_dispatch(ctx, hidden_a, weights_a, plan_a, build_dedup_map=True)
     launch_dispatch_epilogue(ctx, plan_a)
     torch.cuda.synchronize()
     dedup_a_snapshot = clone_dedup_plan_fields(plan_a)
 
+    # The interleaved step B runs at a different s where possible, so the
+    # saved plan must carry its own token count.
     case_b = replace(case, routing="all_local")
-    hidden_b = torch.randn(case.S, case.H, dtype=torch.bfloat16, device="cuda")
-    weights_b = torch.rand(case.S, case.K, dtype=torch.float32, device="cuda")
-    topk_b, tpe_b = make_topk(case_b, rank, R)
-    plan_b, _cu = allocate_planning_outputs(ctx)
-    launch_planning(ctx, topk_b.reshape(-1).contiguous(), tpe_b, _cu, plan_b)
+    s_b = case.S if s != case.S else max(1, case.S // 2)
+    hidden_b = torch.randn(s_b, case.H, dtype=torch.bfloat16, device="cuda")
+    weights_b = torch.rand(s_b, case.K, dtype=torch.float32, device="cuda")
+    topk_b, tpe_b = make_topk(case_b, rank, R, s=s_b)
+    plan_b, _cu = allocate_planning_outputs(ctx, s_b)
+    launch_planning(ctx, topk_b.reshape(-1).contiguous(), tpe_b, plan=plan_b, cu_seqlens=_cu)
     launch_dispatch(ctx, hidden_b, weights_b, plan_b, build_dedup_map=True)
     launch_dispatch_epilogue(ctx, plan_b)
     torch.cuda.synchronize()
@@ -405,7 +508,7 @@ def test_dispatch_saved_plan_hidden_only_reuses_dst_and_skips_weights(dist_env):
     torch.cuda.synchronize()
 
     scatter_errors, checked = _verify_dispatch_by_dst(
-        ctx, case, rank, R, dst_a, check_weights=False, hidden_user=hidden_user
+        ctx, case, rank, R, dst_a, check_weights=False, hidden_user=hidden_user, s=s
     )
     padding_errors, padding_rows = _zero_row_errors(plan_a.zero_fill_ranges, hidden_user)
     weights_unchanged = torch.equal(ctx["weights_buf_local"], weights_after_b)
@@ -420,9 +523,24 @@ def test_dispatch_saved_plan_hidden_only_reuses_dst_and_skips_weights(dist_env):
         checked > 0 and padding_rows > 0 and not errors,
         rank,
         R,
-        "saved-plan hidden-only dispatch",
+        f"saved-plan hidden-only dispatch [s={s}/{case.S}]",
         "; ".join(errors[:5]) or f"checked={checked}, padding_rows={padding_rows}",
     )
+
+
+def test_dispatch_saved_plan_hidden_only_reuses_dst_and_skips_weights(dist_env):
+    rank, R = dist_env
+    case = SAVED_PLAN_CASE
+    ctx = init_case(case, R)
+    _check_saved_plan_hidden_only(ctx, case, rank, R, case.S)
+
+
+def test_dispatch_partial_tokens_saved_plan_reuse(dist_env):
+    rank, R = dist_env
+    case = SAVED_PLAN_CASE
+    ctx = init_case(case, R)
+    for s in partial_token_counts(case.S):
+        _check_saved_plan_hidden_only(ctx, case, rank, R, s)
 
 
 @pytest.mark.parametrize("case", case_params(LARGE_DISPATCH_CASES))
@@ -462,7 +580,7 @@ def test_dispatch_rejects_bad_inputs(dist_env):
     hidden = _traceable_hidden(rank, case.S, case.H)
     weights = torch.rand(case.S, case.K, dtype=torch.float32, device="cuda")
     plan, _cu = allocate_planning_outputs(ctx)
-    launch_planning(ctx, topk.reshape(-1).contiguous(), tpe, _cu, plan)
+    launch_planning(ctx, topk.reshape(-1).contiguous(), tpe, plan=plan, cu_seqlens=_cu)
 
     with pytest.raises(AssertionError, match="hidden_sh"):
         launch_dispatch(ctx, hidden.float(), weights, plan, build_dedup_map=True)
@@ -484,6 +602,15 @@ def test_dispatch_rejects_bad_inputs(dist_env):
             plan,
             build_dedup_map=True,
         )
+    # A plan made for s tokens rejects hidden with a different row count.
+    s = case.S // 2
+    topk_s, tpe_s = make_topk(case, rank, R, s=s)
+    plan_s, _cu_s = allocate_planning_outputs(ctx, s)
+    launch_planning(ctx, topk_s.reshape(-1).contiguous(), tpe_s, plan=plan_s, cu_seqlens=_cu_s)
+    with pytest.raises(AssertionError, match="hidden_sh"):
+        launch_dispatch(ctx, hidden, weights[:s].contiguous(), plan_s, build_dedup_map=True)
+    with pytest.raises(AssertionError, match="route_weights_sk"):
+        launch_dispatch(ctx, hidden[:s].contiguous(), weights, plan_s, build_dedup_map=True)
     bad_plan = plan.clone()
     object.__setattr__(bad_plan, "dst", plan.dst.long())
     with pytest.raises(AssertionError, match="dst"):

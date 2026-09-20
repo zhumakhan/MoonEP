@@ -44,10 +44,15 @@ from moonep.inter_rank_sync import launch_inter_rank_sync
 class _MoonEPDispatch(torch.autograd.Function):
     """dispatch fwd / combine bwd.
 
-    Forward scatters [S, H] tokens (and their [S, K] routing weights) into
-    the expert-grouped [NvS, H] layout across ranks. Backward combines the
-    slot gradients back: each token's K slot grads are summed into grad_x,
-    and each slot's weight grad is gathered back to its (s, k) position.
+    Forward scatters [s, H] tokens (and their [s, K] routing weights),
+    1 <= s <= S, into the expert-grouped shard across ranks. The returned
+    h_nvs / w_nvs are [plan.nvs_s, H] / [plan.nvs_s] prefix views of that
+    shard (nvs_s = ceil(total_tokens*K/R) + segment padding bound <= NvS, the same
+    value on every rank),
+    so they scale with the step, not the Buffer capacity. Backward combines
+    the slot gradients back: each token's K slot grads are summed into
+    grad_x, and each slot's weight grad is gathered back to its (token, k)
+    position. combine accepts the [nvs_s, ...] grads directly.
     """
 
     @staticmethod
@@ -73,14 +78,21 @@ class _MoonEPDispatch(torch.autograd.Function):
 class _MoonEPCombine(torch.autograd.Function):
     """combine fwd / dispatch bwd.
 
-    Forward gathers every token's K expert outputs from the [NvS, H] shard
-    back to its source rank and sums -> [S, H]. Backward re-dispatches the
-    output grad with the saved plan: grad_out[s] is scattered to each of
-    token s's slots (duplicate slots included, via the epilogue expansion).
+    Forward gathers every token's K expert outputs from the [plan.nvs_s, H]
+    view of the shard back to its source rank and sums -> [s, H]. Backward
+    re-dispatches the output grad with the saved plan: grad_out[t] is
+    scattered to each of token t's slots (duplicate slots included, via the
+    epilogue expansion) and comes back as the same [plan.nvs_s, H] view.
     """
 
     @staticmethod
     def forward(ctx, z_nvs, buffer, plan):
+        # Buffer.combine also accepts the full [NvS, H] shard, but backward
+        # returns a [plan.nvs_s, H] grad, so autograd needs the prefix view here.
+        assert z_nvs.shape[0] == plan.nvs_s, (
+            f"expected the [plan.nvs_s={plan.nvs_s}, H] view dispatch returned, "
+            f"got {tuple(z_nvs.shape)}"
+        )
         out, _, _ = buffer.combine(plan=plan, hidden_nvsh=z_nvs.contiguous())
         ctx.buffer, ctx.plan = buffer, plan
         return out
@@ -223,9 +235,12 @@ class MoonEPMoE(nn.Module):
         # groups >= E are the copied experts (prefetch rows). Padding rows
         # are zero-filled by dispatch, so their FFN output is exactly zero.
         # No host sync: _grouped_mm only touches rows inside the cu_seqlens
-        # groups, so feed the whole [NvS, H] shard. Rows past the last group
-        # end are referenced by no dst slot; they come out as exact zeros in
-        # forward and their grads never reach a weight grad.
+        # groups, so feed the returned [plan.nvs_s, H] view as is. The
+        # planner keeps every slot of this rank inside that prefix, i.e.
+        # cu_seqlens[-1] <= plan.nvs_s, so offs stay in bounds; cu_seqlens
+        # itself stays [E+B] for any s. Rows in [cu_seqlens[-1], nvs_s) are
+        # referenced by no dst slot; they come out as exact zeros in forward
+        # and their grads never reach a weight grad.
         gate = torch._grouped_mm(h_nvs, self.w_gate, offs=cu_seqlens)
         up = torch._grouped_mm(h_nvs, self.w_up, offs=cu_seqlens)
         y = torch._grouped_mm(F.silu(gate) * up, self.w_down, offs=cu_seqlens)
@@ -237,7 +252,7 @@ class MoonEPMoE(nn.Module):
         z = (y.float() * w_used[:, None]).to(torch.bfloat16)
 
         # combine: gather every token's K expert outputs back to its source
-        # rank and sum -> [S, H] (backward: re-dispatch with the saved plan)
+        # rank and sum -> [s, H] (backward: re-dispatch with the saved plan)
         return _MoonEPCombine.apply(z, self.buffer, plan)
 
 

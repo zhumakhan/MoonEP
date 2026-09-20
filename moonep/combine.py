@@ -127,17 +127,17 @@ class CombineKernel:
     def __call__(
         self,
         # Tensors / pointers
-        output_ptr: cute.Pointer,        # bf16 [S, H]
-        output_sk_ptr: cute.Pointer,     # int32 view of fp32 [S, K] (or placeholder)
+        output_ptr: cute.Pointer,        # bf16 [s, H]; s = num_tokens <= S (layout declared at capacity S)
+        output_sk_ptr: cute.Pointer,     # int32 view of fp32 [s, K] (or placeholder)
         hidden_ptr: cute.Pointer,        # bf16 [R*NvS_padded, H]
         meta_ptr: cute.Pointer,          # int32 [R*meta_chunk_padded]
-        dst_ptr: cute.Pointer,           # int32 [N=S*K]
+        dst_ptr: cute.Pointer,           # int32 [N=s*K]
         bar_ptr: cute.Pointer,           # int32 [1] grid barrier counter
         # Scalars
         rank: Int32,
         weights_off: Int32,
         barrier_off: Int32,
-        num_tokens: Int32, # this step's tokens per rank,  <= S
+        num_tokens: Int32,               # this step's tokens on this rank (s), 1 <= s <= S
         stream: cuda.CUstream,
     ):
         H = cutlass.const_expr(self.H)
@@ -174,6 +174,8 @@ class CombineKernel:
         )
         # output_sk: when with_weights=False the kernel never reads it; the
         # caller passes a placeholder. We only need a sized tensor when we do.
+        # Layout declared at capacity S*K; only the first s*K entries are
+        # indexed (per-block token ranges stop at num_tokens).
         if cutlass.const_expr(self.with_weights):
             sk_tensor = cute.make_tensor(
                 output_sk_ptr, cute.make_layout((S * K,))

@@ -5,7 +5,7 @@ Sweeps:
   - hidden_size: 3584, 7168
   - topk:        8, 16
   - ep_size:     4, 8  (sub-groups carved out of the global world)
-  - seq_length:  8192
+  - seq_length:  8192  (S, the Buffer capacity)
   - bias_ratio:  0.1, 1, 5
                  sigma of the lognormal expert-logit distribution (mirrors
                  the unbalance forcing used in training). 0.1 -> near
@@ -13,6 +13,11 @@ Sweeps:
 
 E is fixed at 896 total experts; experts-per-rank (epn = E / ep) shrinks as
 the EP group grows.
+
+``--num-tokens s`` (default: S) runs every timed op with ``s <= S`` tokens
+per rank on a Buffer built for S, i.e. the partial-``s`` path (the routing
+is the first ``s`` rows of the S-token draw; every rank passes the same
+``s``). Bandwidth figures use ``s``.
 
 Reports the MoonEP communication operators used by Megatron:
   - dispatch_fwd: dispatch kernel with route-weight scatter (dedup: only
@@ -69,7 +74,6 @@ import csv
 import gc
 import math
 import os
-import time
 import traceback
 
 import torch
@@ -167,9 +171,15 @@ def time_gpu_op(launch_fn, warmup, iters, group, cudagraph=True):
 
 def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
               num_sms=32, warmup=5, iters=20,
-              cudagraph: bool = True):
-    """Run one (R, S, K, E, H, Hp, bias_ratio) configuration on the given subgroup."""
+              cudagraph: bool = True, num_tokens=None):
+    """Run one (R, S, K, E, H, Hp, bias_ratio) configuration on the given subgroup.
+
+    ``num_tokens`` (``s``, default ``S``) is the per-rank token count of the
+    timed step; ``S`` stays the Buffer capacity.
+    """
     dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+    s = S if num_tokens is None else int(num_tokens)
+    assert 0 < s <= S, f"--num-tokens {s} outside [1, S={S}]"
 
     buffer = Buffer(
         S, H, K, E, R, num_sms=num_sms, group=group,
@@ -181,6 +191,10 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     # real training); rank -> independent per-token draws.
     topk, tpe = generate_topk_routing(S, K, E, R, bias_ratio, dev, 1234,
                                       rank=group_rank)
+    if s < S:
+        # partial-s step: keep the first s tokens of the S-token draw
+        topk = topk[:s].contiguous()
+        tpe = torch.bincount(topk.flatten(), minlength=E).to(torch.int32)
 
     # Global expert-load imbalance:
     # per-expert routed token count summed over ranks, max / mean.
@@ -190,15 +204,15 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     mean_load = float(global_tpe.sum().item()) / E
     load_max_mean = max_load / mean_load if mean_load else 0.0
 
-    hidden = torch.randn(S, H, dtype=torch.bfloat16, device=dev)
-    weights = torch.rand(S, K, dtype=torch.float32, device=dev)
-    output = torch.empty(S, H, dtype=torch.bfloat16, device=dev)
+    hidden = torch.randn(s, H, dtype=torch.bfloat16, device=dev)
+    weights = torch.rand(s, K, dtype=torch.float32, device=dev)
+    output = torch.empty(s, H, dtype=torch.bfloat16, device=dev)
     topk_flat = topk.reshape(-1).contiguous()
 
-    plan, cu_seqlens = allocate_planning_outputs(ctx)
+    plan, cu_seqlens = allocate_planning_outputs(ctx, s)
 
     def _plan_call():
-        launch_planning(ctx, topk_flat, tpe, cu_seqlens, plan)
+        launch_planning(ctx, topk_flat, tpe, plan=plan, cu_seqlens=cu_seqlens)
 
     planning_us = time_gpu_op(_plan_call, warmup, iters, group, cudagraph=cudagraph)
 
@@ -207,7 +221,7 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     # dup_counts), which then drive the dispatch epilogue / combine prologue.
     # The plan carries the full [R, B] experts_to_copy table needed by
     # prefetch/grad_reduce.
-    launch_planning(ctx, topk_flat, tpe, cu_seqlens, plan)
+    launch_planning(ctx, topk_flat, tpe, plan=plan, cu_seqlens=cu_seqlens)
     dst = plan.dst
     experts_to_copy = plan.experts_to_copy
     NvS = int(ctx['NvS'])
@@ -238,7 +252,7 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     )
 
     # ---- dispatch_bwd: hidden-only dispatch with the saved plan.
-    grad_output = torch.randn(S, H, dtype=torch.bfloat16, device=dev)
+    grad_output = torch.randn(s, H, dtype=torch.bfloat16, device=dev)
 
     def _dispatch_bwd_call():
         launch_dispatch(ctx, grad_output, None, plan, build_dedup_map=False)
@@ -263,7 +277,7 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     # iterations keep the exact same memory work regardless of the
     # accumulated values.
     hidden_nvsh = torch.randn(NvS, H, dtype=torch.bfloat16, device=dev)
-    droute_weights_sk = torch.empty(S, K, dtype=torch.float32, device=dev)
+    droute_weights_sk = torch.empty(s, K, dtype=torch.float32, device=dev)
     ctx['hidden_buf_local'].copy_(hidden_nvsh)
     torch.cuda.synchronize()
     dist.barrier(group=group)
@@ -276,7 +290,7 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
         _combine_prologue_fwd_call, warmup, iters, group, cudagraph=cudagraph
     )
 
-    # ---- combine_fwd: forward combine gathers/sums K rows back to [S, H].
+    # ---- combine_fwd: forward combine gathers/sums K rows back to [s, H].
     def _combine_fwd_call():
         launch_combine(ctx, output, dst)
 
@@ -367,11 +381,11 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
 
     grad_reduce_us = time_gpu_op(_grad_reduce_call, warmup, iters, group, cudagraph=cudagraph)
 
-    # Byte accounting follows the timed operator work above.
-    dispatch_fwd_bytes = S * K * H * 2
-    dispatch_bwd_bytes = S * K * H * 2
-    combine_fwd_bytes = S * K * H * 2
-    combine_bwd_bytes = S * K * H * 2
+    # Byte accounting follows the timed operator work above (s tokens/rank).
+    dispatch_fwd_bytes = s * K * H * 2
+    dispatch_bwd_bytes = s * K * H * 2
+    combine_fwd_bytes = s * K * H * 2
+    combine_bwd_bytes = s * K * H * 2
 
     # Local-op bandwidth accounting (route weights ignored: [NvS] fp32 is
     # negligible next to [NvS, H] bf16).
@@ -420,6 +434,7 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     grad_reduce_bytes = mx_experts * H * Hp * 4  # fp32 grads
 
     result = {
+        'num_tokens': s,
         'planning_us': planning_us,
         'dispatch_fwd_us': dispatch_fwd_us,
         'dispatch_bwd_us': dispatch_bwd_us,
@@ -520,7 +535,12 @@ def main():
     # profiling unusual (ep, E) combos that the default ep*14 sweep doesn't
     # produce; the planning CuTe DSL path must have a matching specialization.
     ap.add_argument("--experts", type=int, default=None)
+    # Per-rank token count s of the timed step (1 <= s <= S); S stays the
+    # Buffer capacity. Default: s = S.
+    ap.add_argument("--num-tokens", type=int, default=None,
+                    help="Tokens per rank per step (default: S, the capacity).")
     args = ap.parse_args()
+    assert args.num_tokens is None or args.num_tokens > 0, "--num-tokens must be >= 1"
     assert args.hp % 128 == 0, f"--hp must be a multiple of 128, got {args.hp}"
 
     world_rank, world_size, local_rank = setup()
@@ -556,7 +576,7 @@ def main():
     csv_writer = None
     csv_file = None
     csv_header = [
-        "ep", "H", "K", "S", "E", "Hp", "unbalance_ratio",
+        "ep", "H", "K", "S", "s", "E", "Hp", "unbalance_ratio",
         "max_recv", "max_send", "load_max_mean",
         "planning_us",
         "dispatch_fwd_us", "dispatch_bwd_us",
@@ -581,7 +601,7 @@ def main():
         csv_writer.writerow(csv_header)
 
     if world_rank == 0:
-        header = (f"{'ep':>3} {'H':>5} {'K':>3} {'S':>5} {'E':>4} {'Hp':>5} "
+        header = (f"{'ep':>3} {'H':>5} {'K':>3} {'S':>5} {'s':>5} {'E':>4} {'Hp':>5} "
                   f"{'unb_r':>5} {'mx_rcv':>6} {'mx_snd':>6} {'mx/mean':>7} "
                   f"{'plan_us':>9} "
                   f"{'d_fwd':>9} {'d_bwd':>9} "
@@ -603,6 +623,7 @@ def main():
         ep = cfg['ep']
         if ep > world_size:
             continue
+        s_req = cfg['S'] if args.num_tokens is None else args.num_tokens
         group = ep_groups.get(ep)
         in_group = (world_rank < ep)
 
@@ -617,6 +638,7 @@ def main():
                     num_sms=args.num_sms,
                     warmup=args.warmup, iters=args.iters,
                     cudagraph=args.cudagraph,
+                    num_tokens=args.num_tokens,
                 )
             except Exception:
                 if world_rank == 0:
@@ -630,7 +652,8 @@ def main():
 
         if world_rank == 0:
             if res is not None:
-                line = (f"{ep:>3} {cfg['H']:>5} {cfg['K']:>3} {cfg['S']:>5} {cfg['E']:>4} "
+                line = (f"{ep:>3} {cfg['H']:>5} {cfg['K']:>3} {cfg['S']:>5} "
+                        f"{res['num_tokens']:>5} {cfg['E']:>4} "
                         f"{args.hp:>5} "
                         f"{cfg['unbalance_ratio']:>5.2f} "
                         f"{res['max_recv']:>6d} "
@@ -665,7 +688,7 @@ def main():
                 print(line, flush=True)
                 if csv_writer:
                     csv_writer.writerow([
-                        ep, cfg['H'], cfg['K'], cfg['S'], cfg['E'], args.hp,
+                        ep, cfg['H'], cfg['K'], cfg['S'], res['num_tokens'], cfg['E'], args.hp,
                         f"{cfg['unbalance_ratio']:.2f}",
                         res['max_recv'],
                         res['max_send'],
@@ -699,13 +722,14 @@ def main():
                     ])
                     csv_file.flush()
             else:
-                line = (f"{ep:>3} {cfg['H']:>5} {cfg['K']:>3} {cfg['S']:>5} {cfg['E']:>4} "
+                line = (f"{ep:>3} {cfg['H']:>5} {cfg['K']:>3} {cfg['S']:>5} "
+                        f"{s_req:>5} {cfg['E']:>4} "
                         f"{args.hp:>5} "
                         f"{cfg['unbalance_ratio']:>5.2f} FAILED")
                 print(line, flush=True)
                 if csv_writer:
                     row = [
-                        ep, cfg['H'], cfg['K'], cfg['S'], cfg['E'], args.hp,
+                        ep, cfg['H'], cfg['K'], cfg['S'], s_req, cfg['E'], args.hp,
                         f"{cfg['unbalance_ratio']:.2f}",
                         "", "", "", "", "", "", "", "", "", "", "", "", "", "",
                     ]

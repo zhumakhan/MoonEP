@@ -4,9 +4,9 @@ MoonEP is an Expert Parallelism communication library that keeps token loads per
 
 **Notation**: `S` = token capacity per rank, `s` = tokens per call (`1 <= s <= S`), `K` = routed top-k per token.
 
-1. **Perfect balance**: every rank receives exactly `s × K` tokens, no matter how skewed the routing is. A small number of redundant experts is planned online from the current router outputs and prefetched before expert computation; their gradients are reduced back to their home ranks in the backward pass.
+1. **Perfect balance**: every rank receives the same number of tokens (`s × K` when every rank passes `s` tokens), no matter how skewed the routing is. A small number of redundant experts is planned online from the current router outputs and prefetched before expert computation; their gradients are reduced back to their home ranks in the backward pass.
 2. **Online planning**: a near-optimal GPU planning kernel with negligible overhead
-3. **Zero copy and static shapes**: fused permute/unpermute — tokens are sent directly to their expert-grouped positions on remote ranks and buffer views are returned to the computation. Only a fixed `S × K` buffer is needed, and statically known shapes eliminate per-layer MoE host synchronization.
+3. **Zero copy and static shapes**: fused permute/unpermute — tokens are sent directly to their expert-grouped positions on remote ranks and buffer views are returned to the computation. Only a fixed `S × K` buffer is needed, and every shape depends only on the step's token count `s`, never on the routing, so no per-layer MoE host synchronization is needed.
 
 ## Performance
 
@@ -40,7 +40,7 @@ where $T_e$ is the number of tokens routed to expert $e$, and $\bar{T}$ is the e
 
 ### Integration
 
-**Notation**: `S` = token capacity per rank (fixed at `Buffer` construction; sizes every buffer), `s` = actual input tokens per rank in a given call (`1 <= s <= S`, must be the same on every rank), `K` = routed top-k per token, `E` = total routed experts in the EP group, `R` = number of EP ranks (EP comm size), `B` = weight prefetch slots per rank, `NvS` = dispatched token slots per rank (`S × K` real-token capacity plus per-VM-group padding), `H` = hidden size, `H'` = expert FFN intermediate size.
+**Notation**: `S` = token capacity per rank (fixed at `Buffer` construction; sizes every buffer), `s` = actual input tokens per rank in a given call (`1 <= s <= S`; the same on every rank unless `total_num_tokens` is passed), `K` = routed top-k per token, `E` = total routed experts in the EP group, `R` = number of EP ranks (EP comm size), `B` = weight prefetch slots per rank, `NvS` = dispatched token slots per rank (`S × K` real-token capacity plus per-VM-group padding), `nvs_s` = `plan.nvs_s`, the slots dispatch may fill this step (receive cap plus padding bound, `<= NvS`), `H` = hidden size, `H'` = expert FFN intermediate size.
 
 MoonEP's contract with a training or inference framework is **one contiguous symmetric-memory weight tensor per expert projection, plus a planner-produced `cu_seqlens`**. The VM group GEMM consumes a single `[E+B, H, H']` weight tensor; `cu_seqlens[E+B]` (returned by `dispatch`) selects which expert rows are active for the current step.
 
@@ -79,7 +79,11 @@ buffer = Buffer(S=4096, H=7168, K=8, E=256, num_ep_ranks=8,
 
 - `num_sms=None` defaults to 32. `B` defaults to `E // num_ep_ranks`; an explicit value like `B=4` may also be passed.
 - `dispatch` / `combine` / `prefetch_weight` / `reduce_grad` all accept `async_finish=True` to run on the comm stream and return a CUDA event.
-- `S` is a capacity, not a per-call shape. Each `dispatch` / `combine` call may pass any `s` tokens with `1 <= s <= S` (`s = hidden_sh.shape[0]`; `route_weights_sk` / `topk_experts_sk` must then be `[s, K]`), as long as every rank passes the same `s` in a given step. Buffers are sized once for `S`; the returned `plan` remembers `s` (`plan.num_tokens`), so `combine` and both backward passes that reuse the plan produce `[s, ...]` outputs and assert that `s` matches. `hidden_nvsh` / `route_weights_nvs` / `cu_seqlens` stay at the fixed `[NvS, ...]` / `[E+B]` capacity shapes.
+- `S` is a capacity, not a per-call shape. Each `dispatch` / `combine` call may pass any `s` tokens with `1 <= s <= S` (`s = hidden_sh.shape[0]`; `route_weights_sk` / `topk_experts_sk` must then be exactly `[s, K]`; non-contiguous or non-16-byte-aligned inputs, e.g. slices, are copied to a contiguous aligned tensor first). Buffers are sized once for `S`; the returned `plan` remembers `s` (`plan.num_tokens`), so `combine` and both backward passes that reuse the plan produce `[s, ...]` outputs and assert that `s` matches. `s = 0` is not supported: pass a dummy token.
+  - **Same `s` on every rank (default).** With `total_num_tokens=None`, every rank must pass the same `s` in a step, and the planner verifies this on device: every rank checks `sum(tokens_per_expert) == s × K` and rank 0 compares every rank's total against its own. A violation traps the planning kernel with a printed message: the local `sum(tokens_per_expert) != s × K` check traps on that rank, the cross-rank checks trap on rank 0, which sees every rank's totals (a CUDA error there; the peers hang at the next cross-rank barrier until `torchrun` kills them). Every rank then receives exactly `s × K` slots.
+  - **Per-rank `s`.** Pass `total_num_tokens=<sum of s over the EP group>` (host-known, e.g. from the dataloader or one `all_gather` of ints) and each rank may pass its own `s`. Every rank receives `floor(total_num_tokens × K / R)` slots, plus one for the first `(total_num_tokens × K) mod R` ranks; the planner checks the gathered totals against `total_num_tokens × K` on every rank and traps otherwise, so `total_num_tokens` must be identical on all ranks. `total_num_tokens` is ignored when a saved `plan` is reused.
+  - **Step-sized views.** `dispatch` returns `hidden_nvsh` as `[plan.nvs_s, H]` and `route_weights_nvs` as `[plan.nvs_s]`, where `plan.nvs_s` = `ceil(total_num_tokens × K / R)` (an upper bound of every rank's receive cap, so the same value on every rank) + the segment padding bound (`(token_padding - 1) × 2 × E/R`, never more than `NvS`). The planner keeps every slot of this rank, and hence `cu_seqlens[-1]`, inside that prefix, so `torch._grouped_mm(hidden_nvsh, w, offs=cu_seqlens)` works unchanged and the expert FFN's activations scale with the step, not the capacity. `combine` accepts either those `[plan.nvs_s, ...]` views or the full `[NvS, ...]` shard. `cu_seqlens` stays `[E+B]`. With `torch._grouped_mm` as the consumer, a smaller `token_padding` shrinks the padding bound further.
+  - **CUDA graphs / `torch.compile`.** `s` (and `total_num_tokens`) are kernel arguments and `plan.nvs_s` sizes the returned views, so a captured graph (or a static-shape compile) is only valid for the `(s, total_num_tokens)` it was captured with. Run the comm kernels at the exact `s` wherever you can (they loop over `s`; no padding tokens exist) and bucket `s` only where a framework needs static shapes: capture one graph per bucket and pad the input to the bucket's `s`.
 
 #### dispatch fwd
 
@@ -90,10 +94,14 @@ hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
     topk_experts_sk,    # [s, K] int32
     tokens_per_expert,  # [E] int32, local count
 )
-# hidden_nvsh:       [NvS, H] bf16 — dispatched tokens in physical VM group order
-# route_weights_nvs: [NvS] fp32
-# cu_seqlens:        [E+B] int32 — padded token end offset per VM group row
+# hidden_nvsh:       [plan.nvs_s, H] bf16 — dispatched tokens in physical VM group order
+#                    (nvs_s = receive cap + padding bound <= NvS; scales with s, not S)
+# route_weights_nvs: [plan.nvs_s] fp32
+# cu_seqlens:        [E+B] int32 — padded token end offset per VM group row; stays [E+B]
+#                    for any s, and cu_seqlens[-1] <= plan.nvs_s
 # plan:              MoonEPCommPlan — save it for prefetch/combine and both backward passes
+#
+# per-rank s: buffer.dispatch(..., total_num_tokens=sum_of_s_over_the_EP_group)
 
 buffer.prefetch_weight(
     plan=plan,
@@ -111,7 +119,7 @@ Backward of dispatch: sum each token's K dispatched grad copies back to token-ma
 ```python
 grad_hidden_sh, _, _ = buffer.combine(
     plan=plan,
-    hidden_nvsh=grad_hidden_nvsh,    # [NvS, H] bf16
+    hidden_nvsh=grad_hidden_nvsh,    # [plan.nvs_s, H] bf16 (or the full [NvS, H] shard)
 )
 # grad_hidden_sh: [s, H] bf16 (s = plan.num_tokens)
 
@@ -133,8 +141,8 @@ buffer.reduce_grad(
 ```python
 output_sh, gathered_route_weights_sk, _ = buffer.combine(
     plan=plan,
-    hidden_nvsh=expert_output_nvsh,       # [NvS, H] bf16
-    route_weights_nvs=route_weights_nvs,  # [NvS] fp32, optional
+    hidden_nvsh=expert_output_nvsh,       # [plan.nvs_s, H] bf16 (or the full [NvS, H] shard)
+    route_weights_nvs=route_weights_nvs,  # [plan.nvs_s] fp32 (or [NvS]), optional
 )
 # output_sh:                 [s, H] bf16 — combined token-major output (s = plan.num_tokens)
 # gathered_route_weights_sk: [s, K] fp32 or None — routing weights gathered back to token-major
@@ -149,7 +157,7 @@ grad_expert_output_nvsh, _, _, _ = buffer.dispatch(
     grad_output_sh,    # [s, H] bf16 (s must equal plan.num_tokens)
     plan=plan,
 )
-# grad_expert_output_nvsh: [NvS, H] bf16
+# grad_expert_output_nvsh: [plan.nvs_s, H] bf16
 ```
 
 #### zero_copy
@@ -161,7 +169,7 @@ hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
     hidden_sh, route_weights_sk, topk_experts_sk, tokens_per_expert,
     zero_copy=True,
 )
-# hidden_nvsh / route_weights_nvs are views of the NVL buffer;
+# hidden_nvsh / route_weights_nvs are [plan.nvs_s, ...] prefix views of the NVL buffer;
 # the expert FFN must write its output in place on hidden_nvsh
 output_sh, gathered_route_weights_sk, _ = buffer.combine(
     plan=plan,

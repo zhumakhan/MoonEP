@@ -228,7 +228,7 @@ class MoonEPRunner:
             hidden, weights, topk, tpe, zero_copy=True, router_weights_zero_copy=True)
         # Scratch plan for the separate (exact) planning measurement.
         self._launch_planning(self.ctx, self._topk_flat, tpe,
-                              self.cu_seqlens, self.plan_scratch)
+                              plan=self.plan_scratch, cu_seqlens=self.cu_seqlens)
         # Byte accounting from the plan's slot table (global expert ids).
         etc_cpu = self.plan.experts_to_copy.cpu()   # [R, B] int32, -1 = idle
         self.max_recv = int((etc_cpu >= 0).sum(dim=1).max().item())
@@ -239,7 +239,7 @@ class MoonEPRunner:
 
     def planning(self):
         self._launch_planning(self.ctx, self._topk_flat, self.tpe,
-                              self.cu_seqlens, self.plan_scratch)
+                              plan=self.plan_scratch, cu_seqlens=self.cu_seqlens)
 
     def _prefetch(self):
         self.buffer.prefetch_weight(

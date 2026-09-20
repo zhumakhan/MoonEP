@@ -40,17 +40,16 @@ def launch_planning_torch_reference(
     group = ctx.get("group")
 
     flat_topk_experts = topk_experts[rank].reshape(-1) if topk_experts.dim() == 3 else topk_experts.reshape(-1)
-    # this step's token count per rank comes from the routing input, not the
-    # Buffer: any 1 <= S <= ctx['S'] is valid (same S on every rank). The
-    # per rank receive target CAP follows it; ctx['NvS_capacity'] is only the 
-    # buffer bound
+    # This rank's token count s comes from the routing input, not the Buffer:
+    # any 1 <= s <= ctx['S'] is valid and ranks may differ. The per-rank
+    # receive caps are derived below from the gathered tokens_per_expert;
+    # ctx['NvS_capacity'] = S*K is only the buffer bound.
     N = int(flat_topk_experts.numel())
     assert N % K == 0, f"topk entries {N} not a multiple of K={K}"
     S = N // K
     assert 0 < S <= int(ctx['S']), f"num_tokens {S} outside [1, S={int(ctx['S'])}]"
-    CAP = N
-    assert CAP <= int(ctx["NvS_capacity"])
-    
+    S_cap = int(ctx['S'])
+
     if tokens_per_expert.dim() == 2:
         tpe = tokens_per_expert
     else:
@@ -73,10 +72,20 @@ def launch_planning_torch_reference(
     for h in range(R):
         group_tokens[h] = expert_count[h * epn:(h + 1) * epn].sum()
 
-    # CAP is the real token capacity of each destination rank. Every source
-    # rank has S*K routed entries, so sum(balance) = 0; positive means the
-    # home group is overloaded, negative means the destination rank has room.
-    balance = group_tokens - CAP
+    # cap[r] is the receive target of each destination rank: the step's
+    # total_slots = sum_r s_r*K entries split evenly, the first
+    # total_slots % R ranks taking one extra slot (kernel: base + (r < rem)).
+    # sum(cap) == total_slots == sum(group_tokens), so sum(balance) = 0;
+    # positive means the home group is overloaded, negative means the
+    # destination rank has room. With equal s this is cap = s*K everywhere.
+    total_slots = int(tpe.sum())
+    assert int(tpe[rank].sum()) == N, (
+        f"tokens_per_expert sums to {int(tpe[rank].sum())} but topk has {N} entries"
+    )
+    cap = torch.full((R,), total_slots // R, dtype=group_tokens.dtype)
+    cap[: total_slots % R] += 1
+    assert int(cap.max()) <= int(ctx["NvS_capacity"])
+    balance = group_tokens - cap
 
     # alloc[e, d] is how many global tokens of expert e land on dest rank d.
     # Note: kernel-side ctx['alloc'] uses the transposed [R, E] layout
@@ -131,7 +140,7 @@ def launch_planning_torch_reference(
 
     if not torch.equal(alloc.sum(dim=1), expert_count):
         raise AssertionError("torch planning reference: per-expert token conservation failed")
-    if bool((alloc.sum(dim=0) > CAP).any().item()):
+    if bool((alloc.sum(dim=0) > cap).any().item()):
         raise AssertionError("torch planning reference: rank capacity exceeded")
 
     if return_alloc:
@@ -261,15 +270,21 @@ def launch_planning_torch_reference(
     dup_loffs_by_rank = torch.zeros((R, NvS), dtype=torch.int32)
     dup_counts_by_rank = torch.zeros((R, 2), dtype=torch.int32)
 
-    dst_by_rank = dst.unsqueeze(dim=0).contiguous()
+    # Ranks may have different token counts, so gather dst padded to the
+    # capacity S_cap*K (sentinel -1: pre-dedup dst is non-negative) and take
+    # each source rank's entry count from its tpe row.
+    dst_padded = torch.full((S_cap * K,), -1, dtype=torch.int32)
+    dst_padded[:N] = dst
+    dst_by_rank = dst_padded.unsqueeze(dim=0).contiguous()
     if R > 1:
         dev = tokens_per_expert.device
-        gathered = [torch.zeros_like(dst, device=dev) for _ in range(R)]
-        dist.all_gather(gathered, dst.to(device=dev), group=group)
+        gathered = [torch.zeros_like(dst_padded, device=dev) for _ in range(R)]
+        dist.all_gather(gathered, dst_padded.to(device=dev), group=group)
         dst_by_rank = torch.stack(gathered).cpu()
+    tokens_by_rank = [int(tpe[r].sum()) // K for r in range(R)]
 
     for src_rank in range(R):
-        for s_tok in range(S):
+        for s_tok in range(tokens_by_rank[src_rank]):
             base = s_tok * K
             dst_vals = dst_by_rank[src_rank, base:base + K]
             dests = torch.div(dst_vals, NvS, rounding_mode="floor")

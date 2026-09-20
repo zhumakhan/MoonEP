@@ -2,7 +2,8 @@
 End-to-end smoke test for the public Buffer dispatch/combine API.
 
 Verifies sync/async dispatch, separate prefetch, combine behavior, and the
-public plan-reuse dispatch path.
+public plan-reuse dispatch path, at the Buffer capacity S, at partial step
+sizes s < S (same s on every rank) and with a different s on every rank.
 
 Run with:
     torchrun --nproc_per_node=8 -m pytest tests/test_e2e.py
@@ -13,7 +14,9 @@ import torch.distributed as dist
 
 from moonep.buffer import create_nvl_single_owner_tensor, pad_dim0_for_alignment
 from moonep import Buffer, MoonEPCommPlan
+from moonep.planning import ceil_div
 from tests.kernel_test_utils import (
+    assert_ulp_all_ranks,
     clone_dedup_plan_fields,
     local_device_index,
     dedup_plan_fields_equal,
@@ -208,10 +211,12 @@ def assert_grad_reduced(rank, R, E, H, Hp, experts_to_copy, args, offsets):
 
 
 def assert_raises_assertion(expected_substr, fn):
+    """``fn()`` must raise AssertionError; ``expected_substr=None`` accepts
+    any message."""
     try:
         fn()
     except AssertionError as exc:
-        assert expected_substr in str(exc), (
+        assert expected_substr is None or expected_substr in str(exc), (
             f"expected assertion containing {expected_substr!r}, got {exc!r}"
         )
     else:
@@ -422,23 +427,98 @@ def test_e2e(dist_env):
     buffer.destroy()
 
 
-def _e2e_partial_tokens(buffer, rank, R, S, H, K, E, s):
-    """dispatch -> combine round trip with s <= S tokens per rank. The Buffer's
-    S is only a capacity: the kernels loop over s and no padding tokens exist."""
+# Per-rank step sizes for the differing-s test, indexed by rank (mod 8) and
+# clamped into [1, S]; deterministic on every rank so the step total needs no
+# collective. Mirrors tests/test_planning.py.
+# 38 (not 37) makes total*K indivisible by R=8 for the e2e shape (K=4), so
+# the +1 remainder slots of the cap rule are exercised.
+PER_RANK_TOKENS_PATTERN = (1, 5, 38, None, "half", 3, 64, 2)
+
+
+def per_rank_tokens(S, rank):
+    entry = PER_RANK_TOKENS_PATTERN[rank % len(PER_RANK_TOKENS_PATTERN)]
+    if entry is None:
+        s = S
+    elif entry == "half":
+        s = S // 2
+    else:
+        s = int(entry)
+    return max(1, min(int(s), S))
+
+
+def assert_zero_fill_rows_zero(plan, hidden_nvsh, route_weights_nvs, tag):
+    """Every segment-padding row listed in plan.zero_fill_ranges is zero in
+    the returned shard (hidden and, when given, the weight slot)."""
+    ranges = plan.zero_fill_ranges.cpu()
+    rows = 0
+    for g in range(ranges.shape[0]):
+        start, n_pad = int(ranges[g, 0].item()), int(ranges[g, 1].item())
+        if n_pad <= 0:
+            continue
+        rows += n_pad
+        assert start + n_pad <= int(hidden_nvsh.shape[0]), \
+            f"{tag}: zero-fill range [{start}, {start + n_pad}) past the returned rows"
+        assert not bool(hidden_nvsh[start:start + n_pad].any()), \
+            f"{tag}: hidden padding rows [{start}, {start + n_pad}) are not zero"
+        if route_weights_nvs is not None:
+            assert not bool(route_weights_nvs[start:start + n_pad].view(torch.int32).any()), \
+                f"{tag}: weight padding rows [{start}, {start + n_pad}) are not zero"
+    return rows
+
+
+def assert_identity_round_trip(out, hidden, K, rank, R, tag):
+    """combine(dispatch(x)) with an identity FFN returns K*x: the K copies are
+    summed in fp32 and rounded once, except that duplicate slots are
+    pre-reduced in bf16 once in the combine prologue (one more rounding)."""
+    expected = (hidden.float() * K).to(torch.bfloat16)
+    assert tuple(out.shape) == tuple(expected.shape), f"{tag}: shape {tuple(out.shape)}"
+    assert_ulp_all_ranks(f"{tag} combine(dispatch(x)) == K*x", out, expected, rank, R, max_ulps=2)
+
+
+def _check_dispatch_views(buffer, plan, h, w, cu, s, K, H, tag, total_num_tokens=None):
+    """Shape and bound checks on a fresh dispatch's outputs at s tokens."""
     ctx = buffer._require_ctx()
+    R = int(ctx["R"])
+    extra = int(ctx["token_padding_extra"])
+    assert isinstance(plan, MoonEPCommPlan)
+    assert plan.num_tokens == s and plan.N == s * K, f"{tag}: plan sized {plan.N}"
+    assert tuple(plan.dst.shape) == (s * K,), f"{tag}: dst shape {tuple(plan.dst.shape)}"
+    if total_num_tokens is None:
+        expected_nvs_s = s * K + extra
+    else:
+        expected_nvs_s = ceil_div(int(total_num_tokens) * K, R) + extra
+    assert plan.nvs_s == expected_nvs_s, f"{tag}: plan.nvs_s={plan.nvs_s}, expected {expected_nvs_s}"
+    assert plan.nvs_s <= int(ctx["NvS"])
+    assert tuple(h.shape) == (plan.nvs_s, H), f"{tag}: hidden_nvsh {tuple(h.shape)}"
+    assert tuple(w.shape) == (plan.nvs_s,), f"{tag}: route_weights_nvs {tuple(w.shape)}"
+    assert w.dtype == torch.float32 and h.dtype == torch.bfloat16
+    assert tuple(cu.shape) == (int(ctx["E"]) + int(ctx["B"]),)
+    total = int(cu[-1].item())
+    assert total <= plan.nvs_s, f"{tag}: cu_seqlens[-1]={total} > plan.nvs_s={plan.nvs_s}"
+    return total
+
+
+def _e2e_partial_tokens(buffer, rank, R, S, H, K, E, B, Hp, s, remote_expert):
+    """dispatch -> combine round trip with s <= S tokens per rank. The Buffer's
+    S is only a capacity: the kernels loop over s, no padding tokens exist and
+    the returned shard views are ``plan.nvs_s = s*K + token_padding_extra``
+    rows. Returns what the caller needs to replay this step's plan later."""
+    ctx = buffer._require_ctx()
+    tag = f"s={s}"
     hidden, weights, topk, tpe = make_inputs(rank, s, H, K, E, seed=100 + s)
 
     # --- fresh planning at s tokens ---
     h_sync, w_sync, cu_sync, plan = buffer.dispatch(hidden, weights, topk, tpe)
     torch.cuda.synchronize()
-    assert plan.num_tokens == s and plan.N == s * K, f"s={s}: plan sized {plan.N}"
-    assert tuple(plan.dst.shape) == (s * K,), f"s={s}: dst shape {tuple(plan.dst.shape)}"
-    # every rank receives exactly s*K real tokens plus per-group padding
-    total = int(cu_sync[-1].item())
+    total = _check_dispatch_views(buffer, plan, h_sync, w_sync, cu_sync, s, K, H, tag)
     pad_extra = int(ctx["token_padding_extra"])
+    # every rank receives exactly s*K real tokens plus per-group padding
     assert s * K <= total <= s * K + pad_extra, \
-        f"s={s}: padded total {total} outside [{s * K}, {s * K + pad_extra}]"
-    h_snap, w_snap = h_sync[:total].clone(), w_sync[:total].clone()
+        f"{tag}: padded total {total} outside [{s * K}, {s * K + pad_extra}]"
+    pad_rows = assert_zero_fill_rows_zero(plan, h_sync, w_sync, tag)
+    assert total - pad_rows == s * K, f"{tag}: {total - pad_rows} real slots, expected {s * K}"
+    h_snap, w_snap = h_sync.clone(), w_sync.clone()
+    plan_snapshot = plan.clone()
 
     # --- async path gives the same plan and shard ---
     h_a, w_a, cu_a, plan_a, ev = buffer.dispatch(
@@ -446,45 +526,158 @@ def _e2e_partial_tokens(buffer, rank, R, S, H, K, E, s):
     )
     ev.wait(torch.cuda.current_stream())
     torch.cuda.synchronize()
-    assert torch.equal(cu_sync, cu_a), f"s={s}: cu_seqlens mismatch"
-    assert torch.equal(plan.dst, plan_a.dst), f"s={s}: dst mismatch"
-    assert torch.equal(h_snap, h_a[:total]), f"s={s}: dispatch hidden mismatch"
-    assert torch.equal(w_snap, w_a[:total]), f"s={s}: dispatch weights mismatch"
+    assert torch.equal(cu_sync, cu_a), f"{tag}: cu_seqlens mismatch"
+    assert torch.equal(plan.dst, plan_a.dst), f"{tag}: dst mismatch"
+    assert plan_a.nvs_s == plan.nvs_s
+    assert torch.equal(h_snap[:total], h_a[:total]), f"{tag}: dispatch hidden mismatch"
+    assert torch.equal(w_snap[:total], w_a[:total]), f"{tag}: dispatch weights mismatch"
+    assert_dedup_plan_semantic_equal(plan_a, plan_snapshot)
 
-    # --- identity "FFN": combine sums each token's K dispatched copies, so
-    # the round trip returns K * hidden (up to one bf16 rounding when
-    # duplicate slots are pre-reduced in the combine prologue) ---
+    # --- prefetch driven by the partial-s plan ---
+    prefetch_args = make_prefetch_args(rank, remote_expert, B)
+    buffer.prefetch_weight(plan=plan, **prefetch_args)
+    torch.cuda.synchronize()
+    assert_prefetched(prefetch_args, plan.experts_to_copy[rank])
+
+    # --- identity "FFN": combine sums each token's K dispatched copies ---
     h_c, w_c, _, _ = buffer.dispatch(hidden, weights, topk, tpe)
     out, gathered, _ = buffer.combine(
         plan=plan, hidden_nvsh=h_c, route_weights_nvs=w_c,
     )
     torch.cuda.synchronize()
-    assert tuple(out.shape) == (s, H), f"s={s}: combine output {tuple(out.shape)}"
-    assert tuple(gathered.shape) == (s, K), f"s={s}: gathered weights {tuple(gathered.shape)}"
-    expected = hidden.float() * K
-    assert torch.allclose(out.float(), expected, rtol=2e-2, atol=1e-2), \
-        f"s={s}: combine(dispatch(x)) != K*x, max diff {(out.float() - expected).abs().max().item()}"
-    assert torch.equal(gathered, weights), f"s={s}: route weight gather mismatch"
+    assert tuple(out.shape) == (s, H), f"{tag}: combine output {tuple(out.shape)}"
+    assert tuple(gathered.shape) == (s, K), f"{tag}: gathered weights {tuple(gathered.shape)}"
+    assert_identity_round_trip(out, hidden, K, rank, R, tag)
+    assert torch.equal(gathered, weights), f"{tag}: route weight gather mismatch"
+    out_snap = out.clone()
+
+    # --- async combine equals the sync result ---
+    h_c, w_c, _, _ = buffer.dispatch(hidden, weights, topk, tpe)
+    out_async, gathered_async, combine_ev = buffer.combine(
+        plan=plan, hidden_nvsh=h_c, route_weights_nvs=w_c, async_finish=True,
+    )
+    combine_ev.wait(torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    assert torch.equal(out_async, out_snap), f"{tag}: async combine hidden mismatch"
+    assert torch.equal(gathered_async, weights), f"{tag}: async combine weights mismatch"
+
+    # --- zero_copy round trip: dispatch returns prefix views of the NVL
+    # shard, combine consumes them in place; bit-exact vs the copies ---
+    h_zc, w_zc, cu_zc, plan_zc = buffer.dispatch(
+        hidden, weights, topk, tpe, zero_copy=True, router_weights_zero_copy=True,
+    )
+    torch.cuda.synchronize()
+    assert h_zc.data_ptr() == ctx["hidden_buf_local"].data_ptr(), \
+        f"{tag}: dispatch(zero_copy=True) must return the NVL shard view"
+    assert w_zc.data_ptr() == ctx["weights_buf_local"].data_ptr(), \
+        f"{tag}: dispatch(router_weights_zero_copy=True) must return the NVL weights view"
+    assert tuple(h_zc.shape) == (plan_zc.nvs_s, H) and tuple(w_zc.shape) == (plan_zc.nvs_s,)
+    assert torch.equal(cu_zc, cu_sync) and torch.equal(plan_zc.dst, plan.dst)
+    assert torch.equal(h_zc[:total], h_snap[:total]), f"{tag}: zero_copy hidden view mismatch"
+    assert torch.equal(w_zc[:total], w_snap[:total]), f"{tag}: zero_copy weights view mismatch"
+    out_zc, gathered_zc, _ = buffer.combine(
+        plan=plan_zc, hidden_nvsh=h_zc, route_weights_nvs=w_zc,
+        zero_copy=True, router_weights_zero_copy=True,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out_zc, out_snap), f"{tag}: zero_copy combine hidden mismatch"
+    assert torch.equal(gathered_zc, weights), f"{tag}: zero_copy combine weights mismatch"
+    assert_raises_assertion(
+        "alias",
+        lambda: buffer.combine(plan=plan_zc, hidden_nvsh=h_snap, zero_copy=True),
+    )
+
+    # --- grad reduce driven by the partial-s plan (dispatch bwd, weight side) ---
+    grad_offsets = (1000.0 + s, 2000.0 + s, 3000.0 + s, 4000.0 + s, 5000.0 + s, 6000.0 + s)
+    grad_args = make_grad_reduce_args(rank, R, E, B, H, Hp, grad_offsets)
+    buffer.reduce_grad(plan=plan, **grad_args)
+    torch.cuda.synchronize()
+    assert_grad_reduced(rank, R, E, H, Hp, plan.experts_to_copy, grad_args, grad_offsets)
 
     # --- plan reuse (the backward paths) carries s along ---
+    dedup_before = clone_dedup_plan_fields(plan)
     h_r, w_r, cu_r, plan_r = buffer.dispatch(hidden, plan=plan)
     torch.cuda.synchronize()
     assert cu_r is None and w_r is None and plan_r is plan
-    assert torch.equal(h_r[:total], h_snap), f"s={s}: plan-reuse hidden mismatch"
+    assert tuple(h_r.shape) == (plan.nvs_s, H), f"{tag}: plan-reuse hidden {tuple(h_r.shape)}"
+    assert torch.equal(h_r[:total], h_snap[:total]), f"{tag}: plan-reuse hidden mismatch"
+    assert dedup_plan_fields_equal(plan, dedup_before), \
+        f"{tag}: plan-reuse dispatch must not rebuild dedup structures"
+    # weights path on plan reuse
+    h_rw, w_rw, cu_rw, plan_rw = buffer.dispatch(hidden, weights, plan=plan)
+    torch.cuda.synchronize()
+    assert cu_rw is None and plan_rw is plan
+    assert tuple(w_rw.shape) == (plan.nvs_s,), f"{tag}: plan-reuse weights {tuple(w_rw.shape)}"
+    assert torch.equal(h_rw[:total], h_snap[:total]), f"{tag}: plan-reuse (weights) hidden mismatch"
+    assert torch.equal(w_rw[:total], w_snap[:total]), f"{tag}: plan-reuse weights mismatch"
+    out_rw, gathered_rw, _ = buffer.combine(plan=plan, hidden_nvsh=h_rw, route_weights_nvs=w_rw)
+    torch.cuda.synchronize()
+    assert torch.equal(out_rw, out_snap) and torch.equal(gathered_rw, weights), \
+        f"{tag}: combine after plan-reuse dispatch mismatch"
+
+    # --- rejections ---
     if s > 1:
         assert_raises_assertion(
             "tokens", lambda: buffer.dispatch(hidden[: s - 1], plan=plan),
         )
+        # topk with a different token count than hidden
+        assert_raises_assertion(
+            "topk_experts_sk",
+            lambda: buffer.dispatch(hidden[: s - 1], weights[: s - 1], topk, tpe),
+        )
+    assert_raises_assertion(
+        "capacity", lambda: buffer.dispatch(hidden[:0], weights[:0], topk[:0], tpe),
+    )
+    # combine needs NvS or plan.nvs_s rows; s*K rows is neither
+    assert plan.nvs_s != s * K and int(ctx["NvS"]) != s * K
+    assert_raises_assertion(
+        None,
+        lambda: buffer.combine(plan=plan, hidden_nvsh=h_snap[: s * K].contiguous()),
+    )
+
+    return {
+        "s": s,
+        "hidden": hidden,
+        "weights": weights,
+        "plan": plan,
+        "total": total,
+        "h_snap": h_snap,
+        "w_snap": w_snap,
+        "out_snap": out_snap,
+    }
+
+
+def _replay_step(buffer, step, tag):
+    """Re-dispatch a saved step's hidden with its saved plan after other
+    steps (at other s) ran on the same Buffer, and combine with it."""
+    plan, total = step["plan"], step["total"]
+    h_r, w_r, _, plan_r = buffer.dispatch(step["hidden"], step["weights"], plan=plan)
+    torch.cuda.synchronize()
+    assert plan_r is plan
+    assert torch.equal(h_r[:total], step["h_snap"][:total]), f"{tag}: replayed hidden mismatch"
+    assert torch.equal(w_r[:total], step["w_snap"][:total]), f"{tag}: replayed weights mismatch"
+    out, gathered, _ = buffer.combine(plan=plan, hidden_nvsh=h_r, route_weights_nvs=w_r)
+    torch.cuda.synchronize()
+    assert torch.equal(out, step["out_snap"]), f"{tag}: replayed combine mismatch"
+    assert torch.equal(gathered, step["weights"]), f"{tag}: replayed weight gather mismatch"
 
 
 def test_e2e_partial_tokens(dist_env):
     rank, R = dist_env
     S, H, K, E = 256, 1024, 4, R * 4
-    buffer = Buffer(S, H, K, E, R, B=2, num_sms=32)
+    B, Hp = 2, 128
+    buffer = Buffer(S, H, K, E, R, B=B, num_sms=32)
+    remote_expert = make_remote_expert(rank, R, E, H, Hp)
     # s < num_sms leaves trailing blocks of the per-token loops empty; s = 1 is
     # the smallest step. Then full capacity on the same Buffer.
-    for s in (S // 2 + 3, 5, 1, S):
-        _e2e_partial_tokens(buffer, rank, R, S, H, K, E, s)
+    steps = [
+        _e2e_partial_tokens(buffer, rank, R, S, H, K, E, B, Hp, s, remote_expert)
+        for s in (S // 2 + 3, 5, 1, S)
+    ]
+    # Plans saved from earlier steps replay after steps at other s ran on the
+    # same Buffer (the backward passes of interleaved micro-batches).
+    for step in steps:
+        _replay_step(buffer, step, f"replay s={step['s']}")
     # a step larger than the capacity is rejected up front
     hidden, weights, topk, tpe = make_inputs(rank, S + 1, H, K, E, seed=7)
     assert_raises_assertion(
@@ -495,8 +688,76 @@ def test_e2e_partial_tokens(dist_env):
     buffer.destroy()
 
 
+def test_e2e_per_rank_tokens(dist_env):
+    """Every rank dispatches a different s_r in the same step. The host
+    passes the step total; the planner sizes each rank's receive cap as
+    ceil_div(total*K, R) rounded per rank, so plan.nvs_s no longer follows
+    this rank's own s_r."""
+    rank, R = dist_env
+    S, H, K, E = 256, 1024, 4, R * 4
+    B = 2
+    buffer = Buffer(S, H, K, E, R, B=B, num_sms=32)
+    ctx = buffer._require_ctx()
+    s_r = per_rank_tokens(S, rank)
+    total = sum(per_rank_tokens(S, r) for r in range(R))
+    assert s_r <= total <= R * S
+    tag = f"s_r={s_r}, total={total}"
+    hidden, weights, topk, tpe = make_inputs(rank, s_r, H, K, E, seed=300 + rank)
+
+    h, w, cu, plan = buffer.dispatch(hidden, weights, topk, tpe, total_num_tokens=total)
+    torch.cuda.synchronize()
+    cu_total = _check_dispatch_views(
+        buffer, plan, h, w, cu, s_r, K, H, tag, total_num_tokens=total
+    )
+    assert plan.nvs_s == ceil_div(total * K, R) + int(ctx["token_padding_extra"])
+    assert cu_total <= plan.nvs_s
+    pad_rows = assert_zero_fill_rows_zero(plan, h, w, tag)
+    cap_r = (total * K) // R + (1 if rank < (total * K) % R else 0)
+    assert cu_total - pad_rows <= cap_r, \
+        f"{tag}: rank receives {cu_total - pad_rows} real slots > cap {cap_r}"
+    # every real slot of the step lands on exactly one rank, so the per-rank
+    # counts sum to total*K (with R=8, K=4 the pattern gives total=497,
+    # total*K=1988, remainder 4: ranks 0-3 hold one slot more than ranks 4-7)
+    real_slots = torch.tensor([cu_total - pad_rows], dtype=torch.int64, device="cuda")
+    all_slots = [torch.zeros_like(real_slots) for _ in range(R)]
+    dist.all_gather(all_slots, real_slots)
+    slot_counts = [int(t.item()) for t in all_slots]
+    assert sum(slot_counts) == total * K, \
+        f"{tag}: real slots across ranks {slot_counts} do not sum to total*K={total * K}"
+    assert all(c <= cap_r_ for c, cap_r_ in zip(
+        slot_counts, [(total * K) // R + (1 if r < (total * K) % R else 0) for r in range(R)])), \
+        f"{tag}: some rank exceeds its cap: {slot_counts}"
+    h_snap, w_snap = h.clone(), w.clone()
+
+    # identity round trip and exact weight gather, [s_r, H] / [s_r, K] outputs
+    h_c, w_c, _, _ = buffer.dispatch(hidden, weights, topk, tpe, total_num_tokens=total)
+    out, gathered, _ = buffer.combine(plan=plan, hidden_nvsh=h_c, route_weights_nvs=w_c)
+    torch.cuda.synchronize()
+    assert tuple(out.shape) == (s_r, H), f"{tag}: combine output {tuple(out.shape)}"
+    assert tuple(gathered.shape) == (s_r, K), f"{tag}: gathered weights {tuple(gathered.shape)}"
+    assert_identity_round_trip(out, hidden, K, rank, R, tag)
+    assert torch.equal(gathered, weights), f"{tag}: route weight gather mismatch"
+
+    # plan reuse ignores total_num_tokens and carries s_r and nvs_s along
+    h_r, w_r, cu_r, plan_r = buffer.dispatch(hidden, weights, plan=plan)
+    torch.cuda.synchronize()
+    assert cu_r is None and plan_r is plan
+    assert tuple(h_r.shape) == (plan.nvs_s, H) and tuple(w_r.shape) == (plan.nvs_s,)
+    assert torch.equal(h_r[:cu_total], h_snap[:cu_total]), f"{tag}: plan-reuse hidden mismatch"
+    assert torch.equal(w_r[:cu_total], w_snap[:cu_total]), f"{tag}: plan-reuse weights mismatch"
+    out_r, gathered_r, _ = buffer.combine(plan=plan, hidden_nvsh=h_r, route_weights_nvs=w_r)
+    torch.cuda.synchronize()
+    assert torch.equal(out_r, out) and torch.equal(gathered_r, weights), \
+        f"{tag}: combine after plan-reuse dispatch mismatch"
+
+    if rank == 0:
+        print("[test_e2e_per_rank_tokens] PASS: per-rank s dispatch/combine round trips match.")
+    buffer.destroy()
+
+
 if __name__ == "__main__":
     env = setup()
     test_e2e(env)
     test_e2e_partial_tokens(env)
+    test_e2e_per_rank_tokens(env)
     dist.destroy_process_group()
