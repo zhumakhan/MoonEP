@@ -7,6 +7,10 @@ import tempfile
 import torch
 import torch.distributed as dist
 
+# torch 2.14 renamed ``all_gather_into_tensor`` to ``all_gather_single`` (same
+# signature) and emits a FutureWarning on the old name; keep older torch working.
+_all_gather_single = getattr(dist, "all_gather_single", None) or dist.all_gather_into_tensor
+
 from moonep._C import (
     FABRIC_HANDLE_BYTES as _FABRIC_HANDLE_BYTES,
     nvl_dist_alloc,
@@ -44,7 +48,7 @@ def _use_fabric_for_group(group: dist.ProcessGroup | None) -> bool:
     else:
         local = torch.tensor([supported], dtype=torch.uint8, device="cuda")
         gathered = torch.empty(world_size, dtype=torch.uint8, device="cuda")
-        dist.all_gather_into_tensor(gathered, local, group=group)
+        _all_gather_single(gathered, local, group=group)
         unsupported = (gathered == 0).nonzero().flatten().tolist()
 
     if mode == "fabric":
@@ -65,7 +69,7 @@ def _all_gather_shareables(
     world_size = dist.get_world_size(group=group)
     gathered = torch.empty(world_size, _FABRIC_HANDLE_BYTES,
                            dtype=torch.uint8, device="cuda")
-    dist.all_gather_into_tensor(
+    _all_gather_single(
         gathered, local_handle.cuda().view(1, _FABRIC_HANDLE_BYTES), group=group)
     return gathered.cpu()
 

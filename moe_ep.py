@@ -43,10 +43,10 @@ class EPMoE(nn.Module):
 
     def forward(self, x):
         # --- route ---
-        # fp32 logits/softmax, matching moe_moon_ep.route: bf16 logits produce
-        # ties that make topk pick different experts, so the two EP paths would
-        # not be comparable
-        logits = self.router(x).float()
+        # fp32 gating end to end (the router stays fp32 while the experts are
+        # bf16), matching moe_moon_ep.route: bf16 logits would flip top-k on
+        # near-ties and the two EP paths would not be comparable
+        logits = self.router(x.float())
         weights, idx = torch.topk(logits, k=self.K, dim=-1)
         weights = F.softmax(weights, dim=-1)
 
@@ -114,7 +114,7 @@ class EPMoE(nn.Module):
     def forward_reference(self, x):
         """No-communication reference: per-expert loop over gathered weights."""
         wg, wu, wd = self.full_weights()
-        logits = self.router(x).float()
+        logits = self.router(x.float())
         weights, idx = torch.topk(logits, k=self.K, dim=-1)
         weights = F.softmax(weights, dim=-1)
         flat_w = weights.flatten()
@@ -143,6 +143,7 @@ def main():
     # all R*S*K rows on rank 0, whose FFN intermediates would OOM at S=8192
     S, K, E, H, Hi = 1024*4, 16, 128, 4096, 4096*2
     moe = EPMoE(E, K, H, Hi).to(dev, torch.bfloat16)
+    moe.router.float()   # bf16 experts, fp32 router (gating), like MoonEPMoE
 
     # IMBALANCED=1: zero the router weight => every logit ties => topk breaks
     # ties by index and picks experts 0..K-1 for every token. K == epn here,

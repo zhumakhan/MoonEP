@@ -7,19 +7,43 @@ load-balancing "copied" experts into the B local prefetch slots.
 
 Weight storage follows bench_vs_deepep's composite [E+B] layout: every rank
 allocates its own [epn, H, *] expert chunk plus a [B, H, *] prefetch chunk,
-exchanges VMM fds, and maps all R expert chunks + its local prefetch chunk
+exchanges VMM handles, and maps all R expert chunks + its local prefetch chunk
 into one contiguous VA. Rows [0, E) are the global expert pool (remote rows
 walk NVLink), rows [E, E+B) are local prefetch slots — exactly the tensor
 Buffer.prefetch_weight expects. Requires B == epn and the chunk byte size to
 be a multiple of the VMM granularity.
 
+Gradients mirror that layout in fp32, which is what Buffer.reduce_grad takes:
+per projection one contiguous [E+B, H, *] fp32 "main grad" whose rows [0, E)
+are every rank's own-expert grad chunk (this rank writes only its own rows)
+and whose rows [E, E+B) are this rank's reduce chunk. The same reduce chunks
+are also mapped as the [R, B, H, *] all-rank view reduce_grad reads. A
+post-accumulate-grad hook folds autograd's bf16 .grad into the main grad
+(own rows + copied-expert rows) and frees it, so copied experts' grads land
+in the reduce buffer directly, with no publish copy.
+
 Autograd: dispatch and combine are transposes of each other, so each gets a
 custom autograd.Function whose backward is the other call with the saved plan
 (api.py's documented recipe). The FFN between them is ordinary autograd over
-the [E+B] weight Parameters. The prefetch rows [E, E+B) accumulate real
-gradients for *copied* (remote-owned) experts; reduce_expert_grads() ships
-them home over NVLink with the grad_reduce kernel and adds them into the
-owners' rows.
+the [E+B] weight Parameters. reduce_expert_grads() then runs
+Buffer.reduce_grad: every rank remote-reads the reduce slots that hold its
+own experts, accumulates them into its main-grad rows, and clears the slots
+it consumed for the next microbatch.
+
+Precision: fp32 master weights, bf16 expert compute, fp32 gating.
+``parameters()`` are the fp32 masters (this rank's [epn, H, *] expert rows
+and the replicated router); the optimizer updates only those. The expert
+forward/backward run on bf16 compute copies (non-persistent buffers): the
+[E+B] composites above. Their bf16 grads are folded into fp32 storage that
+the expert masters' .grad permanently alias, so after reduce_expert_grads()
+the optimizer sees fully reduced fp32 grads. sync_compute_weights() casts the
+masters back into the bf16 copies after every optimizer step; peers pick up
+the new expert rows over NVLink at their next prefetch, which every dispatch's
+inter-rank sync orders after the refresh. The router has no bf16 copy: gating
+(logits, top-k, softmax) runs in fp32 on the master itself, the usual MoE
+practice since bf16 logits flip top-k choices on near-ties. Every rank routes
+a different token batch, so reduce_expert_grads() also sums the router grad
+over the EP group; the replicas then take identical optimizer steps.
 
 Run:
     torchrun --nproc_per_node=8 moe_moon_ep.py
@@ -36,7 +60,6 @@ from moonep import Buffer
 from moonep._C import nvl_dist_alloc, nvl_dist_map, nvl_release_mem_handle, get_vmm_granularity
 from moonep.buffer import (
     _all_gather_shareables, _exchange_ipc_fds, _use_fabric_for_group,
-    create_nvl_dist_tensor,
 )
 from moonep.inter_rank_sync import launch_inter_rank_sync
 
@@ -106,7 +129,14 @@ class _MoonEPCombine(torch.autograd.Function):
 
 
 class MoonEPMoE(nn.Module):
-    """Top-K MoE with grouped-GEMM experts, expert-parallel via MoonEP."""
+    """Top-K MoE with grouped-GEMM experts, expert-parallel via MoonEP.
+
+    Mixed precision: fp32 masters (``parameters()``) for the optimizer, bf16
+    compute copies of the experts for the forward/backward, fp32 gating. The
+    expert masters' ``.grad`` alias the module's persistent fp32 grad storage,
+    so use ``moe.zero_grad()`` (never ``opt.zero_grad(set_to_none=True)``) and
+    call ``sync_compute_weights()`` after every ``opt.step()``.
+    """
 
     def __init__(self, E, K, H, Hi, S, group=None, num_sms=32):
         super().__init__()
@@ -115,89 +145,210 @@ class MoonEPMoE(nn.Module):
         self.rank = dist.get_rank(group)
         self.R = dist.get_world_size(group)
         self.epn = E // self.R
-
-        # router is replicated: construct under a fixed seed on every rank
-        torch.manual_seed(0)
-        self.router = nn.Linear(H, E, bias=False, dtype=torch.bfloat16)
+        dev = torch.device('cuda', torch.cuda.current_device())
 
         self.buffer = Buffer(S, H, K, E, self.R, num_sms=num_sms, group=group)
         self.B = int(self.buffer._require_ctx()['B'])
         assert self.B == self.epn, "composite [E+B] weight layout expects B == epn"
 
-        # composite [E+B, ...] weight pools as Parameters; this rank physically
-        # owns rows [rank*epn, (rank+1)*epn) and the prefetch rows [E, E+B)
+        self.lo, self.hi = self.rank * self.epn, (self.rank + 1) * self.epn
+
+        # ---- router: fp32, replicated (fixed seed on every rank) and used
+        # directly by the forward. Gating stays fp32 end to end: bf16 logits
+        # flip top-k choices on near-ties, which destabilizes MoE training.
+        # Its grad is summed over the EP group in reduce_expert_grads().
+        torch.manual_seed(0)
+        router = nn.Linear(H, E, bias=False)
+        self.router_w = nn.Parameter(router.weight.detach().to(dev, torch.float32))
+
+        # ---- experts, bf16 compute copies: composite [E+B, ...] VMM pools.
+        # This rank physically owns rows [lo, hi) and the prefetch rows
+        # [E, E+B). Buffers, not Parameters: the optimizer must never see them.
         self._keepalives = []
-        self.w_gate = nn.Parameter(self._composite_weight((self.epn, H, Hi), group))
-        self.w_up = nn.Parameter(self._composite_weight((self.epn, H, Hi), group))
-        self.w_down = nn.Parameter(self._composite_weight((self.epn, Hi, H), group))
+        for name, shape in (('w_gate', (self.epn, H, Hi)),
+                            ('w_up', (self.epn, H, Hi)),
+                            ('w_down', (self.epn, Hi, H))):
+            w16 = self._composite_weight(shape, group).requires_grad_(True)
+            self.register_buffer(name, w16, persistent=False)
 
-        # fp32 reduce buffers for the copied experts' weight grads: each rank
-        # owns its [B, ...] chunk, all R chunks mapped as one [R, B, ...] view
-        self.rb_gate = create_nvl_dist_tensor(
-            [self.B, H, Hi], torch.float32, self.rank, self.R, group=group,
-        ).view(self.R, self.B, H, Hi)
-        self.rb_up = create_nvl_dist_tensor(
-            [self.B, H, Hi], torch.float32, self.rank, self.R, group=group,
-        ).view(self.R, self.B, H, Hi)
-        self.rb_down = create_nvl_dist_tensor(
-            [self.B, Hi, H], torch.float32, self.rank, self.R, group=group,
-        ).view(self.R, self.B, Hi, H)
-
-        # init only the locally-owned expert rows; zero own reduce chunks
+        # fp32 main grads in the same [E+B, ...] layout (what Buffer.reduce_grad
+        # takes) plus the [R, B, ...] all-rank view of the reduce chunks. Rows
+        # [E, E+B) of each main grad ARE this rank's reduce chunk, so the FFN
+        # backward's copied-expert grads land in the reduce buffer directly.
+        self.mg_gate, self.rb_gate = self._grad_buffers((self.epn, H, Hi), group)
+        self.mg_up, self.rb_up = self._grad_buffers((self.epn, H, Hi), group)
+        self.mg_down, self.rb_down = self._grad_buffers((self.epn, Hi, H), group)
         with torch.no_grad():
-            g = torch.Generator(device=self.w_gate.device).manual_seed(100 + self.rank)
-            lo, hi = self.rank * self.epn, (self.rank + 1) * self.epn
-            for w in (self.w_gate, self.w_up, self.w_down):
-                w[lo:hi].normal_(0.0, 0.02, generator=g)
-            for rb in (self.rb_gate, self.rb_up, self.rb_down):
-                rb[self.rank].zero_()
+            for mg in (self.mg_gate, self.mg_up, self.mg_down):
+                mg[self.lo:self.hi].zero_()
+                mg[self.E:].zero_()   # == rb_*[rank]
+
+        # ---- experts, fp32 masters of this rank's own rows: plain local
+        # tensors. Their .grad permanently alias the owned rows of the main
+        # grads, so after reduce_expert_grads() they hold the reduced grad.
+        g = torch.Generator(device=dev).manual_seed(100 + self.rank)
+
+        def master(*shape):
+            return nn.Parameter(
+                torch.empty(*shape, dtype=torch.float32, device=dev)
+                .normal_(0.0, 0.02, generator=g))
+
+        self.wm_gate = master(self.epn, H, Hi)
+        self.wm_up = master(self.epn, H, Hi)
+        self.wm_down = master(self.epn, Hi, H)
+        self.wm_gate.grad = self.mg_gate[self.lo:self.hi]
+        self.wm_up.grad = self.mg_up[self.lo:self.hi]
+        self.wm_down.grad = self.mg_down[self.lo:self.hi]
+        self.sync_compute_weights()   # bf16 copies of the own expert rows
+
+        # fold autograd's bf16 grads into the fp32 storage as soon as each
+        # compute copy's grad is accumulated, then drop the bf16 grad
+        lo, hi, E_ = self.lo, self.hi, self.E
+        self._grad_hooks = [
+            self._register_grad_fold(w16, [(slice(lo, hi), mg[lo:hi]),
+                                           (slice(E_, None), mg[E_:])])
+            for w16, mg in ((self.w_gate, self.mg_gate),
+                            (self.w_up, self.mg_up),
+                            (self.w_down, self.mg_down))
+        ]
         self._last_plan = None
         torch.cuda.synchronize()
         dist.barrier(group=group)
 
-    def _composite_weight(self, chunk_shape, group):
-        chunk_bytes = chunk_shape[0] * chunk_shape[1] * chunk_shape[2] * 2
+    # ---- VMM mapping helpers ------------------------------------------------
+    # A "share item" is what nvl_dist_map imports for one chunk: an int fd on
+    # the same node, or a uint8[64] CPU fabric handle. Every rank calls these
+    # in the same order (the fd exchange is collective). Received fds are dups
+    # owned by this process and are closed once the mappings exist.
+
+    def _alloc_chunk(self, chunk_shape, dtype, use_fabric):
+        """Allocate one VMM chunk on this GPU; return its exported shareable."""
+        nbytes = dtype.itemsize
+        for d in chunk_shape:
+            nbytes *= d
         gran = get_vmm_granularity()
-        assert chunk_bytes % gran == 0, \
-            f"expert chunk {chunk_bytes} B must be a multiple of VMM granularity {gran}"
-        # Two VMM chunks per rank: the owned expert rows (shared with every
-        # rank) and a local-only chunk for the B prefetch slots. They are mapped
-        # into one contiguous [E + B, ...] VA as R + 1 chunks, using the same
-        # fd / fabric-handle exchange as moonep.buffer.create_nvl_dist_tensor.
-        use_fabric = _use_fabric_for_group(group)
-        ka_w, w_share, w_owned = nvl_dist_alloc(
-            shape=list(chunk_shape), dtype=torch.bfloat16, use_fabric=use_fabric)
-        ka_b, b_share, b_owned = nvl_dist_alloc(
-            shape=list(chunk_shape), dtype=torch.bfloat16, use_fabric=use_fabric)
-        for ka, owned in ((ka_w, w_owned), (ka_b, b_owned)):
-            self._keepalives.append(ka)
-            nvl_release_mem_handle(owned)
+        assert nbytes % gran == 0, (
+            f"chunk {tuple(chunk_shape)} {dtype} = {nbytes} B must be a "
+            f"multiple of VMM granularity {gran}"
+        )
+        ka, share, owned = nvl_dist_alloc(
+            shape=list(chunk_shape), dtype=dtype, use_fabric=use_fabric)
+        self._keepalives.append(ka)
+        nvl_release_mem_handle(owned)
+        return share
+
+    @staticmethod
+    def _local_item(share, use_fabric):
+        return share.cpu().view(-1) if use_fabric else int(share.item())
+
+    def _gathered_items(self, share, group, use_fabric):
+        """Every rank's item for the chunk `share` describes on that rank."""
         if use_fabric:
-            shareables = torch.cat(
-                [_all_gather_shareables(w_share, group), b_share.cpu().view(1, -1)], dim=0)
-            full = nvl_dist_map(
-                chunk_shape=list(chunk_shape), dtype=torch.bfloat16,
-                shareables=shareables, local_rank=self.rank, world_size=self.R + 1,
-                use_fabric=True,
-            )
+            handles = _all_gather_shareables(share, group)   # uint8 [R, 64] CPU
+            return [handles[r] for r in range(self.R)]
+        fds = _exchange_ipc_fds(int(share.item()), list(range(self.R)),
+                                self.rank, self.R, group)
+        return [fds[r] for r in range(self.R)]
+
+    def _map_items(self, chunk_shape, dtype, items, use_fabric):
+        """Map the chunks in `items` back to back into one contiguous VA."""
+        if use_fabric:
+            shareables = torch.stack(items)
         else:
-            w_fd, b_fd = int(w_share.item()), int(b_share.item())
-            fds = _exchange_ipc_fds(w_fd, list(range(self.R)), self.rank, self.R, group)
-            os.close(w_fd)
-            all_fds = [fds[r] for r in range(self.R)] + [b_fd]
-            try:
-                full = nvl_dist_map(
-                    chunk_shape=list(chunk_shape), dtype=torch.bfloat16,
-                    shareables=torch.tensor(all_fds, dtype=torch.int64),
-                    local_rank=self.rank, world_size=self.R + 1, use_fabric=False,
-                )
-            finally:
-                for fd in all_fds:
-                    os.close(fd)
-        return full  # [E + B, chunk_shape[1], chunk_shape[2]]
+            shareables = torch.tensor(items, dtype=torch.int64)
+        return nvl_dist_map(
+            chunk_shape=list(chunk_shape), dtype=dtype, shareables=shareables,
+            local_rank=self.rank, world_size=len(items), use_fabric=use_fabric,
+        )
+
+    @staticmethod
+    def _close_items(items, use_fabric):
+        if not use_fabric:
+            for fd in items:
+                os.close(fd)
+
+    def _composite_weight(self, chunk_shape, group):
+        """bf16 [E+B, ...]: all R ranks' expert chunks, then my prefetch chunk."""
+        use_fabric = _use_fabric_for_group(group)
+        w_share = self._alloc_chunk(chunk_shape, torch.bfloat16, use_fabric)
+        b_share = self._alloc_chunk(chunk_shape, torch.bfloat16, use_fabric)
+        w_items = self._gathered_items(w_share, group, use_fabric)
+        b_item = self._local_item(b_share, use_fabric)
+        try:
+            return self._map_items(
+                chunk_shape, torch.bfloat16, w_items + [b_item], use_fabric)
+        finally:
+            self._close_items(
+                w_items + [b_item, self._local_item(w_share, use_fabric)], use_fabric)
+
+    def _grad_buffers(self, chunk_shape, group):
+        """fp32 (main_grad [E+B, ...], reduce view [R, B, ...]) for one projection.
+
+        main_grad rows [0, E) are the R ranks' own-expert grad chunks: this
+        rank writes only its own rows, the others are mapped so reduce_grad can
+        address rows by global expert id. Rows [E, E+B) are this rank's reduce
+        chunk. The reduce view maps every rank's reduce chunk, so its [rank]
+        entry is the same physical memory as main_grad[E:]. B == epn keeps all
+        chunks the same shape, which nvl_dist_map requires.
+        """
+        use_fabric = _use_fabric_for_group(group)
+        g_share = self._alloc_chunk(chunk_shape, torch.float32, use_fabric)
+        r_share = self._alloc_chunk(chunk_shape, torch.float32, use_fabric)
+        g_items = self._gathered_items(g_share, group, use_fabric)
+        r_items = self._gathered_items(r_share, group, use_fabric)
+        r_local = self._local_item(r_share, use_fabric)
+        try:
+            main_grad = self._map_items(
+                chunk_shape, torch.float32, g_items + [r_local], use_fabric)
+            reduce = self._map_items(chunk_shape, torch.float32, r_items, use_fabric)
+        finally:
+            self._close_items(
+                g_items + r_items + [r_local, self._local_item(g_share, use_fabric)],
+                use_fabric)
+        return main_grad, reduce.view(self.R, self.B, *chunk_shape[1:])
+
+    def _register_grad_fold(self, w16, targets):
+        """Post-accumulate-grad hook on a bf16 compute copy: add the listed
+        row slices of its .grad into fp32 storage, then free the bf16 grad.
+
+        For the expert composites only the owned rows and the prefetch rows
+        are folded: rows of other ranks' experts are live remote mappings
+        (and are zero here anyway, their cu_seqlens segments are empty).
+        """
+        def fold(t):
+            g = t.grad
+            with torch.no_grad():
+                for slc, dst in targets:
+                    dst.add_(g[slc])
+            t.grad = None
+
+        return w16.register_post_accumulate_grad_hook(fold)
+
+    def zero_grad(self, set_to_none: bool = True):
+        """Zero the expert masters' persistent fp32 grad storage in place
+        (their .grad alias it, so `set_to_none` is ignored for them) and drop
+        the router's ordinary autograd grad. The bf16 compute copies' .grad is
+        already None after the fold hooks; reduce_grad clears the consumed
+        reduce rows itself."""
+        with torch.no_grad():
+            for mg in (self.mg_gate, self.mg_up, self.mg_down):
+                mg[self.lo:self.hi].zero_()
+        self.router_w.grad = None
+
+    @torch.no_grad()
+    def sync_compute_weights(self):
+        """fp32 expert masters -> bf16 compute copies (the router has no bf16
+        copy). Call after every optimizer step. Only this rank's own expert
+        rows of the composites are written; peers read them over NVLink at
+        their next prefetch_weight, which the inter-rank sync at the start of
+        every dispatch orders after this."""
+        for w16, wm in ((self.w_gate, self.wm_gate),
+                        (self.w_up, self.wm_up),
+                        (self.w_down, self.wm_down)):
+            w16[self.lo:self.hi].copy_(wm)
 
     def route(self, x):
-        logits = self.router(x).float()
+        logits = F.linear(x.float(), self.router_w)     # fp32 gating: GEMM, top-k, softmax
         weights, idx = torch.topk(logits, k=self.K, dim=-1)
         weights = F.softmax(weights, dim=-1)
         topk = idx.to(torch.int32)
@@ -257,51 +408,38 @@ class MoonEPMoE(nn.Module):
 
 
     def reduce_expert_grads(self):
-        """dispatch bwd, weight side: ship the prefetch-slot (copied expert)
-        grads to their home ranks and accumulate into the owners' rows.
+        """dispatch bwd, weight side: ship the copied experts' grads (my reduce
+        chunk == main_grad[E:]) to their home ranks and accumulate them into
+        the owners' main-grad rows with Buffer.reduce_grad, and sum the
+        replicated router's grad over the EP group.
 
-        Returns fp32 [epn, ...] grads (gate, up, down) for the locally-owned
-        expert rows [rank*epn, (rank+1)*epn), fully reduced. param.grad is
-        updated in place: owned rows reduced, prefetch rows zeroed (consumed)."""
+        Call once per microbatch, after backward() and before any DP grad
+        reduction / optimizer step: the next forward's plan reassigns the
+        slots. Returns fp32 [epn, ...] views of the fully reduced owned rows
+        (gate, up, down); the kernel zeros the consumed reduce slots itself."""
         assert self._last_plan is not None, "reduce_expert_grads needs a prior forward"
-        E = self.E
-        lo, hi = self.rank * self.epn, (self.rank + 1) * self.epn
         ctx = self.buffer._require_ctx()
-        pairs = (
-            (self.w_gate, self.rb_gate),
-            (self.w_up, self.rb_up),
-            (self.w_down, self.rb_down),
+        # The router is replicated across the EP group but every rank routed a
+        # different token batch: sum the local grads (the loss is a sum over
+        # tokens, matching the summed expert grads) so every replica takes the
+        # same optimizer step and stays bit-identical.
+        assert self.router_w.grad is not None, "call backward() before reduce_expert_grads()"
+        dist.all_reduce(self.router_w.grad, op=dist.ReduceOp.SUM, group=self.group)
+        # reduce_grad has no entry barrier: every rank's backward (the grad
+        # hooks) must have finished writing its reduce chunk before any rank
+        # remote-reads it. Device-side sync, no host round trip.
+        launch_inter_rank_sync(ctx)
+        self.buffer.reduce_grad(
+            plan=self._last_plan,
+            full_gate_grad=self.mg_gate,
+            full_up_grad=self.mg_up,
+            full_down_grad=self.mg_down,
+            gate_reduce_buffer=self.rb_gate,
+            up_reduce_buffer=self.rb_up,
+            down_reduce_buffer=self.rb_down,
         )
-        # torch-based NVLink reduce instead of launch_grad_reduce: the kernel
-        # addresses rows by global expert id, so it requires contiguous fp32
-        # [E, H, H'] grads (~17 GiB per projection at benchmark shapes). The
-        # reduce chunks are NVL-mapped and readable from every rank, so the
-        # owner can accumulate its few slots directly; fp32 staging shrinks
-        # to one [epn, H, H'] slice.
-        with torch.no_grad():
-            for p, rb in pairs:
-                assert p.grad is not None, "call backward() before reduce_expert_grads()"
-                rb[self.rank].copy_(p.grad[E:])   # publish my copies' grads (-> fp32)
-            # all ranks must finish publishing before anyone reads (device-side)
-            launch_inter_rank_sync(ctx)
-
-            etc = self._last_plan.experts_to_copy.cpu()   # [R, B], small
-            outs = []
-            for p, rb in pairs:
-                g_local = p.grad[lo:hi].float()           # [epn, H, H'] fp32
-                for r in range(self.R):
-                    for b in range(self.B):
-                        e = int(etc[r, b])
-                        if lo <= e < hi:
-                            g_local[e - lo] += rb[r, b]   # remote read over NVLink
-                p.grad[lo:hi].copy_(g_local.to(p.grad.dtype))
-                p.grad[E:].zero_()                        # consumed by the reduce
-                outs.append(g_local)
-            # peers must finish reading my chunk before I clear it for reuse
-            launch_inter_rank_sync(ctx)
-            for _, rb in pairs:
-                rb[self.rank].zero_()
-        return outs
+        lo, hi = self.lo, self.hi
+        return self.mg_gate[lo:hi], self.mg_up[lo:hi], self.mg_down[lo:hi]
 
     def forward_reference(self, x):
         """Single-rank reference: per-expert loop over the global weight pool
@@ -335,12 +473,12 @@ def reference_grads(moe, x, gout):
     plain autograd, no communication. Returns (out, dx, drouter, dwg, dwu, dwd)."""
     E, K = moe.E, moe.K
     xr = x.detach().clone().requires_grad_()
-    rw = moe.router.weight.detach().clone().requires_grad_()
+    rw = moe.router_w.detach().clone().requires_grad_()
     wg = moe.w_gate.detach()[:E].clone().requires_grad_()
     wu = moe.w_up.detach()[:E].clone().requires_grad_()
     wd = moe.w_down.detach()[:E].clone().requires_grad_()
 
-    logits = (xr @ rw.T).float()
+    logits = xr.float() @ rw.T          # fp32 gating, like MoonEPMoE.route
     w, idx = torch.topk(logits, k=K, dim=-1)
     w = F.softmax(w, dim=-1)
     flat_w = w.flatten()
@@ -369,22 +507,29 @@ def main():
     dev = f'cuda:{local_rank}'
 
     S, K, E, H, Hi = 1024*4, 16, 128, 4096, 4096*2
-    moe = MoonEPMoE(E, K, H, Hi, S).to(dev)
-    
+    moe = MoonEPMoE(E, K, H, Hi, S)
+
+    # skew the routing by zeroing part of the (fp32, replicated) router
     with torch.no_grad():
-        moe.router.weight[:64].zero_()
-        
+        moe.router_w[:64].zero_()
+
+    # AdamW over the fp32 masters only: parameters() excludes the bf16 compute
+    # copies. The masters' .grad alias MoonEPMoE's persistent fp32 grad
+    # storage, so grads are cleared with moe.zero_grad(), never opt.zero_grad().
+    opt = torch.optim.AdamW(moe.parameters(), lr=1e-4, weight_decay=0.0)
+
     g = torch.Generator(device=dev).manual_seed(42 + rank)
     x = torch.randn(S, H, dtype=torch.bfloat16, device=dev, generator=g).requires_grad_(True)
     gout = torch.randn(S, H, dtype=torch.float32, device=dev, generator=g)
 
-    # ---- EP forward + backward ----
+    # ---- EP forward + backward + grad reduce (no update yet) ----
     y = moe(x)
     (y.float() * gout).sum().backward()
     g_gate, g_up, g_down = moe.reduce_expert_grads()
+    g_gate_first = g_gate.clone()   # views into the main grads: snapshot for the replay check
 
-    # ---- dense reference on the same weights (needs ~4x the expert weight
-    # bytes for clones + their grads: skip when it cannot fit) ----
+    # ---- dense reference on the same bf16 compute weights (needs ~4x the
+    # expert weight bytes for clones + their grads: skip when it cannot fit) ----
     lo, hi = rank * moe.epn, (rank + 1) * moe.epn
     ref_bytes = 4 * 3 * E * H * Hi * 2
     free_bytes, _ = torch.cuda.mem_get_info()
@@ -400,11 +545,15 @@ def main():
 
         report("forward", y, y_ref)
         report("dx", x.grad, dx_ref)
-        report("drouter", moe.router.weight.grad, drouter_ref)
+        # the router grad is summed over the EP group in reduce_expert_grads;
+        # the reference saw only this rank's tokens, so sum it the same way
+        drouter_total = drouter_ref.float().contiguous()
+        dist.all_reduce(drouter_total)
+        report("drouter", moe.router_w.grad, drouter_total)
 
         # expert grads: the true total sums every rank's token contributions;
-        # compare my owned slice of the reduced EP grads against the
-        # allreduced reference
+        # compare my owned slice of the reduced EP grads (== the masters'
+        # .grad) against the allreduced reference
         for name, mine, ref in (
             ("dw_gate", g_gate, dwg_ref),
             ("dw_up", g_up, dwu_ref),
@@ -418,35 +567,57 @@ def main():
         print(f"[rank {rank}] skipping dense reference "
               f"(needs ~{ref_bytes / (1 << 30):.0f} GiB, {free_bytes / (1 << 30):.0f} GiB free)")
 
-    # ---- timed train steps (fwd + bwd + grad reduce) ----
+    # ---- buffer/reduce-slot reuse: identical steps without a weight update
+    # must reproduce step 1 exactly ----
     for _ in range(10):
-        moe.zero_grad(set_to_none=True)
+        moe.zero_grad()
         x.grad = None
         y2 = moe(x)
         (y2.float() * gout).sum().backward()
         g_gate2, _, _ = moe.reduce_expert_grads()
+    step_diff = (g_gate2 - g_gate_first).abs().max().item()
+    print(f"[rank {rank}] step replay dw_gate diff {step_diff:.3e}")
 
+    # ---- timed train steps: fwd + bwd + grad reduce + AdamW on the fp32
+    # masters + bf16 refresh of the compute copies ----
+    def train_step():
+        moe.zero_grad()
+        x.grad = None
+        out = moe(x)
+        (out.float() * gout).sum().backward()
+        moe.reduce_expert_grads()
+        opt.step()
+        moe.sync_compute_weights()
+
+    for _ in range(10):
+        train_step()
     torch.cuda.synchronize()
     dist.barrier()
     time_start = time.perf_counter()
     n_iters = 100
     for _ in range(n_iters):
-        moe.zero_grad(set_to_none=True)
-        x.grad = None
-        y2 = moe(x)
-        (y2.float() * gout).sum().backward()
-        g_gate2, _, _ = moe.reduce_expert_grads()
+        train_step()
     torch.cuda.synchronize()
     time_end = time.perf_counter()
 
     ms = (time_end - time_start) / n_iters * 1e3
     t = torch.tensor([ms], device=dev)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    print(f"[rank {rank}] {ms:.3f} ms/step fwd+bwd+reduce (slowest rank: {t.item():.3f} ms)")
+    print(f"[rank {rank}] {ms:.3f} ms/step fwd+bwd+reduce+AdamW (slowest rank: {t.item():.3f} ms)")
 
-    # buffer/reduce-slot reuse across steps must reproduce step 1 exactly
-    step_diff = (g_gate2 - g_gate).abs().max().item()
-    print(f"[rank {rank}] step replay dw_gate diff {step_diff:.3e}")
+    # after the last refresh the bf16 compute copies must be exactly the cast
+    # masters, and the replicated router must be bit-identical on every rank
+    with torch.no_grad():
+        consistent = all(
+            torch.equal(w16[lo:hi], wm.to(torch.bfloat16))
+            for w16, wm in ((moe.w_gate, moe.wm_gate), (moe.w_up, moe.wm_up),
+                            (moe.w_down, moe.wm_down))
+        )
+        router_ref = moe.router_w.detach().clone()
+        dist.broadcast(router_ref, src=0)
+        router_in_sync = torch.equal(moe.router_w, router_ref)
+    print(f"[rank {rank}] bf16 compute copies == cast fp32 masters: {consistent}; "
+          f"router identical across ranks: {router_in_sync}")
 
     torch.cuda.synchronize()
     dist.barrier()

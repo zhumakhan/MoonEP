@@ -39,7 +39,7 @@ def sync_weights(moon, ep):
     """
     lo, hi = moon.rank * moon.epn, (moon.rank + 1) * moon.epn
     with torch.no_grad():
-        ep.router.weight.copy_(moon.router.weight)
+        ep.router.weight.copy_(moon.router_w)
         ep.w_gate.copy_(moon.w_gate[lo:hi])
         ep.w_up.copy_(moon.w_up[lo:hi])
         ep.w_down.copy_(moon.w_down[lo:hi])
@@ -50,10 +50,10 @@ def dense_reference(moon, x, gout):
     Returns (out, dx, drouter). Expert-weight grads are checked separately."""
     E, K = moon.E, moon.K
     xr = x.detach().clone().requires_grad_()
-    rw = moon.router.weight.detach().clone().requires_grad_()
+    rw = moon.router_w.detach().clone().requires_grad_()
     wg, wu, wd = (moon.w_gate.detach(), moon.w_up.detach(), moon.w_down.detach())
 
-    logits = (xr @ rw.T).float()
+    logits = xr.float() @ rw.T          # fp32 gating, like both EP models
     w, idx = torch.topk(logits, k=K, dim=-1)
     w = F.softmax(w, dim=-1)
     flat_w, flat_e = w.flatten(), idx.flatten()
@@ -115,12 +115,13 @@ def main():
               f"epn={E // R} routing={'IMBALANCED' if imbalanced else 'balanced'} "
               f"iters={iters}", flush=True)
 
-    moon = MoonEPMoE(E, K, H, Hi, S).to(dev)
+    moon = MoonEPMoE(E, K, H, Hi, S)   # already on this device; never .to() it
     ep = EPMoE(E, K, H, Hi).to(dev, torch.bfloat16)
+    ep.router.float()   # bf16 experts, fp32 router, like MoonEPMoE
     if imbalanced:
         # every logit ties -> topk picks experts 0..K-1 for every token
         with torch.no_grad():
-            moon.router.weight.zero_()
+            moon.router_w.zero_()
     sync_weights(moon, ep)
 
     g = torch.Generator(device=dev).manual_seed(42 + rank)
@@ -142,11 +143,19 @@ def main():
 
         y_ref, dx_ref, drouter_ref = dense_reference(moon, x, gout)
 
+        # MoonEPMoE sums the replicated router's grad over the EP group in
+        # reduce_expert_grads; the reference and vanilla EP saw only this
+        # rank's tokens, so sum those the same way before comparing
+        drouter_total = drouter_ref.float().contiguous()
+        dist.all_reduce(drouter_total)
+        ep_drouter_total = ep.router.weight.grad.float().contiguous()
+        dist.all_reduce(ep_drouter_total)
+
         rows = [
             ("forward",  rel(y_m, y_ref),               rel(y_e, y_ref)),
             ("dx",       rel(x_m.grad, dx_ref),         rel(x_e.grad, dx_ref)),
-            ("drouter",  rel(moon.router.weight.grad, drouter_ref),
-                         rel(ep.router.weight.grad, drouter_ref)),
+            ("drouter",  rel(moon.router_w.grad, drouter_total),
+                         rel(ep_drouter_total, drouter_total)),
             # both EP paths hold only this rank's owned experts after reduce
             ("dw_gate",  0.0, rel(ep.w_gate.grad, gm_gate)),
             ("dw_up",    0.0, rel(ep.w_up.grad, gm_up)),
