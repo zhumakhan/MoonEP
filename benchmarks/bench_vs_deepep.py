@@ -45,10 +45,15 @@ Single node only (ep == world size). Launch:
 import argparse
 import csv
 import os
+import sys
 import time
 
 import torch
 import torch.distributed as dist
+
+# torchrun puts benchmarks/ (not the repo root) on sys.path, so `tests` and
+# `moonep` are not importable without this.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.generate_topk_routing import generate_topk_routing
 
@@ -292,10 +297,33 @@ class MoonEPRunner:
 class DeepEPV2Runner:
     NAME = 'deepep_v2'
 
-    def __init__(self, group, R, S, K, E, H, num_sms):
+    def __init__(self, group, R, S, K, E, H, num_sms, cpu_sync='auto'):
         import deep_ep
         self.deep_ep = deep_ep
         self.S, self.E, self.num_sms = S, E, num_sms
+        # Non-cached dispatch without CPU sync allocates the WORST CASE
+        # expanded output (buffer.hpp: `num_ranks * num_max_tokens_per_rank *
+        # min(num_topk, num_local_experts)` rows), i.e. every token of every
+        # rank landing on this rank's local experts. At S=128K that is
+        # 8 * 128K * 8 = 8.4M rows = 112 GiB of bf16 hidden and OOMs.
+        # `do_cpu_sync=1` instead waits on the host for the real per-expert
+        # counts and allocates exactly `sum(counts)` rows (~S*K), at the cost
+        # of a GPU->CPU round trip inside the timed region.
+        worst_rows = R * S * min(K, E // R)
+        worst_bytes = worst_rows * H * 2
+        free_bytes = torch.cuda.mem_get_info()[0]
+        if cpu_sync == 'auto':
+            # Two live worst-case buffers coexist (prepare's `recv_x` is held
+            # for combine while a timed dispatch allocates another), so require
+            # headroom for both.
+            self.cpu_sync = 2 * worst_bytes > 0.8 * free_bytes
+        else:
+            self.cpu_sync = bool(int(cpu_sync))
+        if dist.get_rank() == 0:
+            print(f'[deepep] worst-case expanded output '
+                  f'{worst_bytes / 2**30:.1f} GiB ({worst_rows} rows), '
+                  f'{free_bytes / 2**30:.1f} GiB free -> '
+                  f'do_cpu_sync={int(self.cpu_sync)}', flush=True)
         self.buffer = deep_ep.ElasticBuffer(
             group, num_max_tokens_per_rank=S, hidden=H,
             deterministic=False, allow_hybrid_mode=True,
@@ -308,7 +336,8 @@ class DeepEPV2Runner:
         return dict(num_sms=self.num_sms, num_qps=self.num_qps,
                     num_max_tokens_per_rank=self.S, num_experts=self.E,
                     expert_alignment=128, async_with_compute_stream=0,
-                    allocate_on_comm_stream=0, do_handle_copy=1, do_cpu_sync=0,
+                    allocate_on_comm_stream=0, do_handle_copy=1,
+                    do_cpu_sync=int(self.cpu_sync),
                     do_expand=True, use_tma_aligned_col_major_sf=True)
 
     def prepare(self, topk, tpe, hidden, weights):
@@ -370,6 +399,8 @@ def main():
     ap.add_argument('--maxvios', default='0.2,1,10,20',
                     help='Comma-separated target MaxVio values; the lognormal '
                          'sigma is reverse-solved for each (default: %(default)s)')
+    ap.add_argument('--tokens', type=int, default=128 * 1024,
+                    help='Tokens per rank S (default: %(default)s = 128K)')
     ap.add_argument('--experts', type=int, default=384)
     ap.add_argument('--hidden', type=int, default=7168)
     ap.add_argument('--topk', type=int, default=8)
@@ -377,6 +408,11 @@ def main():
                     help='Expert weight inner dim H\' (MoE intermediate size) '
                          'for the MoonEP prefetch op (default: %(default)s)')
     ap.add_argument('--num-sms', type=int, default=32)
+    ap.add_argument('--deepep-cpu-sync', default='auto', choices=['auto', '0', '1'],
+                    help="DeepEP's non-cached dispatch sizes its expanded "
+                         'output for the worst case unless it syncs the real '
+                         'counts to the host. "auto" (default) turns the sync '
+                         'on only when the worst case would not fit.')
     ap.add_argument('--warmup', type=int, default=20)
     ap.add_argument('--iters', type=int, default=50)
     args = ap.parse_args()
@@ -390,14 +426,15 @@ def main():
     group = dist.group.WORLD
     dev = torch.device(f'cuda:{local_rank}')
 
-    S, E = 8192, args.experts
+    S, E = args.tokens, args.experts
     H, K = args.hidden, args.topk
     targets = [float(x) for x in args.maxvios.split(',')]
 
     def make_runner(lib):
         if lib == 'moonep':
             return MoonEPRunner(group, R, S, K, E, H, args.num_sms, hp=args.hp)
-        return RUNNERS[lib](group, R, S, K, E, H, args.num_sms)
+        return DeepEPV2Runner(group, R, S, K, E, H, args.num_sms,
+                              cpu_sync=args.deepep_cpu_sync)
 
     # Buffers depend only on (S, H, K, E, num_sms) — not on the routing —
     # so each library's buffer is created ONCE and reused across MaxVio points.
@@ -463,7 +500,7 @@ def main():
                 # out ~= 0 — i.e. v2's layout cost is negligible. No prefetch op.
                 plan_us = max(d_f - d_b, 0.0)
                 pf, pf_gbps = 0.0, 0.0
-            rows.append(dict(lib=lib, ep=R, E=E, H=H, K=K, sigma=sigma,
+            rows.append(dict(lib=lib, ep=R, S=S, E=E, H=H, K=K, sigma=sigma,
                              target_maxvio=target, maxvio=maxvio,
                              plan_us=plan_us, pf_us=pf,
                              d_f_us=d_f, d_b_us=d_b, c_f_us=c_f, c_b_us=c_b,
@@ -618,11 +655,12 @@ def plot_rows(rows, path):
              '(overlappable with subsequent compute) and is not included '
              'in this benchmark.',
              ha='center', fontsize=8.5, style='italic', color='#444444')
+    S = rows[0]['S']
     E = rows[0]['E']
     H = rows[0]['H']
     K = rows[0]['K']
     fig.suptitle(f'MoonEP vs DeepEP v2 — ep=8, E={E}, H={H}, K={K}, '
-                 f'S=8192/rank, 32 SMs', fontsize=11)
+                 f'S={S}/rank, 32 SMs', fontsize=11)
     fig.tight_layout(rect=[0, 0.055, 1, 0.96])
     fig.savefig(path, dpi=150)
 
