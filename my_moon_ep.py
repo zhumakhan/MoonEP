@@ -93,7 +93,60 @@ class _MoonEPCombine(torch.autograd.Function):
             grad_out.contiguous(), plan=ctx.plan,
         )
         return grad_z, None, None
-    
+
+
+class _GroupedMMLiveGrad(torch.autograd.Function):
+    """``torch._grouped_mm`` that never materializes a weight grad for the
+    dead groups of the composite [E+B] pool.
+
+    The pool has E+B groups, but on this rank only its own experts [lo, hi)
+    and its copy slots [E, E+B) ever hold tokens -- the other E-epn groups are
+    live remote mappings whose cu_seqlens segments are empty. Plain autograd
+    still allocates and writes a dW the full shape of the weight: at E=128,
+    H=4096, Hi=8192 that is 9.00 GiB per projection per backward against the
+    1.00 GiB of live rows, and the cost tracks the tensor size rather than the
+    group occupancy (measured: 144 groups with 32 active and with 16 active
+    both cost ~11 ms, against 2.6 ms for 16 groups).
+
+    Because the dead groups are *empty*, dropping them from ``offs`` yields a
+    bit-identical dW for the groups that survive -- the live groups are the
+    only ones with rows, so the compacted offsets describe the same row
+    ranges. No row slicing is needed, so no host sync. The compact dW is
+    accumulated straight into the fp32 grad pools, which also retires the bf16
+    fold hook (the pool's `.grad` is never populated at all).
+    """
+
+    @staticmethod
+    def forward(ctx, x, w, offs, offs_live, fp32_targets):
+        # `w`, `offs` and `offs_live` ride on ctx rather than
+        # `save_for_backward`: the weight pool is written in place between
+        # this forward and its backward (`prefetch_weight`), and it carries no
+        # grad of its own, so version tracking would only produce a false
+        # positive.
+        ctx.save_for_backward(x)
+        ctx.w, ctx.offs, ctx.offs_live = w, offs, offs_live
+        ctx.fp32_targets = fp32_targets
+        return torch._grouped_mm(x, w, offs=offs)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, = ctx.saved_tensors
+        grad_out = grad_out.contiguous()
+        # dX over the full group set: empty groups cost no work and the output
+        # is only [rows, K], so there is nothing to compact away here.
+        grad_x = torch._grouped_mm(grad_out, ctx.w.transpose(-2, -1),
+                                   offs=ctx.offs)
+        # dW over the live groups only: [epn + B, ...] instead of [E + B, ...].
+        grad_w = torch._grouped_mm(x.t(), grad_out, offs=ctx.offs_live)
+        with torch.no_grad():
+            row = 0
+            for dst in ctx.fp32_targets:
+                n = dst.shape[0]
+                dst.add_(grad_w[row:row + n])
+                row += n
+        return grad_x, None, None, None, None
+
+
 class MoonEPMoe(nn.Module):
     """Top-K MoE with grouped GEMM experts, expert-parallel via MoonEP.
     
@@ -136,7 +189,11 @@ class MoonEPMoe(nn.Module):
                             ('w_up', (self.epn, H, Hi)),
                             ('w_down', (self.epn, Hi, H))
                             ):
-            w16 = self._composite_weight(shape, group).requires_grad_(True)
+            # No autograd on the pool itself: _GroupedMMLiveGrad produces the
+            # weight grad for the live groups only and writes it into the fp32
+            # pools directly, so a bf16 `.grad` the shape of the pool is never
+            # allocated.
+            w16 = self._composite_weight(shape, group).requires_grad_(False)
             self.register_buffer(name, w16, persistent=False)
         
         # fp32 main grads in the same [E+B, ...] layout (what Buffer.reduce_grad
@@ -171,17 +228,12 @@ class MoonEPMoe(nn.Module):
         self.wm_down.grad = self.mg_down[self.lo:self.hi]
         self.sync_compute_weights() # bf16 copies of the own expert rows
         
-        # fold autograd's bf16 grads into the fp32 storage as soon as each
-        # compute copy's grad is accumulated, then drop the bf16 grad
-        lo, hi, E_ = self.lo, self.hi, self.E
-        self._grad_hooks = [
-            self._register_grad_fold(w16, [(slice(lo, hi), mg[lo:hi]),
-                                           (slice(E_, None), mg[E_:])])
-            for w16, mg in ((self.w_gate, self.mg_gate),
-                            (self.w_up, self.mg_up),
-                            (self.w_down, self.mg_down))
-        ]
-        
+        # No fold hooks for the expert pools: _GroupedMMLiveGrad accumulates
+        # the live groups' dW into mg_* inside its backward, so there is no
+        # bf16 `.grad` left to fold. (_register_grad_fold is kept for any
+        # weight that does go through ordinary autograd.)
+        self._grad_hooks = []
+
         self.last_plan = None
         torch.cuda.synchronize()
         dist.barrier(group=group)
@@ -372,9 +424,20 @@ class MoonEPMoe(nn.Module):
         # itself stays [E+B] for any s. Rows in [cu_seqlens[-1], nvs_s] are 
         # referenced by no dst slot; they come out as exact zeros in forward
         # and their grads never reach a weight grad.
-        gate = torch._grouped_mm(h_nvs, self.w_gate, offs=cu_seqlens)
-        up = torch._grouped_mm(h_nvs, self.w_up, offs=cu_seqlens)
-        y = torch._grouped_mm(F.silu(gate) * up, self.w_down, offs=cu_seqlens)
+        #
+        # The forward spans all E+B groups (the empty ones cost no work), but
+        # the weight grad is taken over the live groups only. Groups outside
+        # [lo, hi) and [E, E+B) are empty on this rank, so concatenating their
+        # two cu_seqlens runs is a valid compact `offs` over the same rows --
+        # a device-side cat, no host sync. See _GroupedMMLiveGrad.
+        offs_live = torch.cat((cu_seqlens[self.lo:self.hi], cu_seqlens[self.E:]))
+        gmm = _GroupedMMLiveGrad.apply
+        gate = gmm(h_nvs, self.w_gate, cu_seqlens, offs_live,
+                   (self.mg_gate[self.lo:self.hi], self.mg_gate[self.E:]))
+        up = gmm(h_nvs, self.w_up, cu_seqlens, offs_live,
+                 (self.mg_up[self.lo:self.hi], self.mg_up[self.E:]))
+        y = gmm(F.silu(gate) * up, self.w_down, cu_seqlens, offs_live,
+                (self.mg_down[self.lo:self.hi], self.mg_down[self.E:]))
         
         # scale each slot by its routing weight. Padding and tail slots carry
         # stale weight values (never written for this step) - nan_to_nums keeps
