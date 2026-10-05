@@ -8,6 +8,18 @@ the ``src_info`` scratch; plan reuse reuses these structures directly.
 Inter-block sync uses a software grid barrier (cooperative launch keeps all
 blocks resident); cross-rank sync uses a system-scope atomic self-resetting
 barrier on the NVLink meta_buf.
+
+Token counts: ``S`` is the Buffer capacity (compile time); each rank passes its
+own runtime ``num_tokens`` (``s``, 1 <= s <= S) and the host-known
+``total_tokens`` (sum over ranks). Rank 0 derives every rank's receive cap
+from the gathered tokens_per_expert: ``total_slots = sum_r s_r*K`` split as
+``total_slots // R`` per rank plus one for the first ``total_slots % R`` ranks,
+so the balancer terminates exactly. The host mirrors this as ``plan.nvs_s =
+ceil(total_tokens*K / R) + token_padding_extra``, rounded up to
+``token_padding`` like ``NvS`` (``planning_nvs_s``). The kernel verifies the
+s/tpe contract on device (per-rank ``sum(tpe) == s*K``, the cross-rank total,
+and equal ``s`` when the caller declared uniform counts) and traps on
+violation.
 """
 
 import functools
@@ -24,7 +36,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import make_ptr
 
-from moonep._common import cp_async_bulk_g2s, cross_rank_barrier, grid_sync
+from moonep._common import cp_async_bulk_g2s, cross_rank_barrier, device_trap, grid_sync
 from moonep.constants import KIDX_BITS
 
 
@@ -39,6 +51,13 @@ class MoonEPCommPlan:
     E: int
     NvS: int
     K: int
+    # Rows of this rank's NVL shard that dispatch may write this step:
+    # recv_cap + token_padding_extra rounded up to token_padding (as NvS is),
+    # where recv_cap = ceil(total_tokens*K / R) is the planner's per-rank
+    # receive cap (every rank receives either total_slots // R or one more).
+    # Independent of N: a rank sending few tokens can still receive the
+    # average share, and vice versa. See planning_nvs_s.
+    nvs_s: int
 
     # Dedup structures written by the dispatch builder and consumed by the
     # dispatch epilogue / combine prologue. dup_counts = [n_groups, n_dup_loffs];
@@ -48,12 +67,20 @@ class MoonEPCommPlan:
     dup_loffs: torch.Tensor
     dup_counts: torch.Tensor
 
+    @property
+    def num_tokens(self) -> int:
+        """This rank's token count the plan was made for (``N // K``), <= Buffer S."""
+        return int(self.N) // int(self.K)
+
     def __post_init__(self) -> None:
         N = int(self.N)
         R = int(self.R)
         E = int(self.E)
         epn = E // R
         NvS = int(self.NvS)
+        assert 0 < int(self.nvs_s) <= NvS, (
+            f"plan.nvs_s must be in [1, NvS={NvS}], got {self.nvs_s}"
+        )
         assert self.dst.dtype == torch.int32 and self.dst.is_contiguous()
         assert self.dst.numel() == N
         assert self.experts_to_copy.dtype == torch.int32 and self.experts_to_copy.is_contiguous()
@@ -83,6 +110,7 @@ class MoonEPCommPlan:
             E=self.E,
             NvS=self.NvS,
             K=self.K,
+            nvs_s=self.nvs_s,
         )
 
 
@@ -256,13 +284,14 @@ def reg_scan_argmin_min_idx(reg, N: cutlass.Constexpr, lane):
 
 
 @cute.jit
-def copy_v4_remote(dst, dst_off, src, n: cutlass.Constexpr,
+def copy_v4_remote(dst, dst_off, src, n,
                    pid, tid, nth, num_sms):
     # src[n] -> dst[dst_off:]: scalar head pads to 16B, int4 body does one
     # 128bit store (transactions /4), scalar tail.
     # dst_off may be arbitrarily aligned (dst.iterator is 16B aligned); no src
-    # padding needed.
+    # padding needed. n could be a runtime Int32 count
     head = (-dst_off) & 3                      # make dst_off+head ≡0 mod4 so v4 addresses are 16B aligned
+    head = cutlass.min(head, n)                # n < head must not underflow nv (tiny runtime n)
     nv = (n - head) >> 2                       # number of vectorizable 4-tuples
 
     for h in cutlass.range(pid * nth + tid, head, num_sms * nth):
@@ -275,6 +304,24 @@ def copy_v4_remote(dst, dst_off, src, n: cutlass.Constexpr,
 
     for off in cutlass.range(head + nv * 4 + pid * nth + tid, n, num_sms * nth):
         dst[dst_off + off] = src[off]
+
+
+@cute.jit
+def block_sum_i32(src, n: cutlass.Constexpr, s_acc, tid, num_threads: cutlass.Constexpr):
+    # Block-wide sum of src[0:n]; every thread of the block must call it and
+    # every thread receives the total. s_acc is a dedicated smem Int32 scalar
+    # that the caller never reuses for anything else (no trailing barrier).
+    if tid == 0:
+        s_acc[0] = Int32(0)
+    cute.arch.barrier()
+    acc = Int32(0)
+    for i in cutlass.range(tid, n, num_threads):
+        acc += src[i]
+    acc = cute.arch.warp_redux_sync(acc, "add")
+    if (tid & 31) == 0:
+        cute.arch.atomic_add(s_acc.iterator, acc, scope="cta")
+    cute.arch.barrier()
+    return s_acc[0]
 
 
 @cute.jit
@@ -339,9 +386,15 @@ class PlanningKernel:
 
     @cute.jit
     def __call__(self, tpe, topk, meta, mc, dst, cu_seqlens,
-                 experts_to_copy, zero_fill, remote_stats, alloc, group_tokens, z,
-                 local_hist, bar,
-                 rank: Int32, stream: cuda.CUstream):
+                 experts_to_copy, zero_fill, remote_stats, alloc, group_tokens,
+                 rank_tokens, z, local_hist, bar,
+                 rank: Int32, num_tokens: Int32, total_tokens: Int32, uniform: Int32,
+                 stream: cuda.CUstream):
+        # num_tokens: this rank's token count this step, 1 <= num_tokens <= S.
+        # total_tokens: sum of num_tokens over all EP ranks (host-known).
+        # uniform: nonzero when the host asserts every rank passed the same
+        # num_tokens; rank 0 then verifies it on device and traps otherwise.
+        # S (N = S*K) stay compile time capacities for layout/strides.
         R = cutlass.const_expr(self.R)
         ms = cutlass.const_expr(self.meta_stride)
         N = cutlass.const_expr(self.N)
@@ -358,13 +411,14 @@ class PlanningKernel:
         stats_t = cute.make_tensor(remote_stats, cute.make_layout((2,)))
         alloc_t = cute.make_tensor(alloc, cute.make_layout((R * self.E,)))
         gt_t = cute.make_tensor(group_tokens, cute.make_layout((R,)))
+        rt_t = cute.make_tensor(rank_tokens, cute.make_layout((R,)))
         z_t = cute.make_tensor(z, cute.make_layout((R * R,)))
         lh_t = cute.make_tensor(local_hist, cute.make_layout((self.num_vblocks * self.E,)))
         bar_t = cute.make_tensor(bar, cute.make_layout((1,)))
 
         self.kernel(tpe_t, topk_t, meta_t, mc_t, dst_t, cu_t, etc_t,
-                    zfr_t, stats_t, alloc_t, gt_t, z_t, lh_t, bar_t,
-                    rank).launch(
+                    zfr_t, stats_t, alloc_t, gt_t, rt_t, z_t, lh_t, bar_t,
+                    rank, num_tokens, total_tokens, uniform).launch(
             grid=(num_sms, 1, 1), block=(BLOCK_DIM_P2, 1, 1),
             stream=stream, cooperative=True)
 
@@ -373,14 +427,17 @@ class PlanningKernel:
     # =========================================================
     @cute.jit
     def run_c1(self, topk_src, order_dst, tpe_src, local_hist, s_hist, s_bp, s_wcount,
-               bar_ptr, num_sms, pid, tid):
-        R = cutlass.const_expr(self.R)
+               bar_ptr, num_sms, pid, tid, n_rt):
+        # n_rt: runtime number of valid top-k entries (= num_tokens * K),
+        # n_rt <= N. Only the first ceil(n_rt / BLOCK_SIZE_P2) vblocks carry
+        # data; the tensors below keep their compile time capacity layout
         E = cutlass.const_expr(self.E)
         NUM_WARPS = cutlass.const_expr(BLOCK_DIM_P2 // 32)
         WST = cutlass.const_expr(NUM_WARPS + 1)
         IPT = cutlass.const_expr(ITEMS_PER_THREAD_P2)
         N = cutlass.const_expr(self.N)
         num_vblocks = cutlass.const_expr(self.num_vblocks)
+        nvb_rt = (n_rt + BLOCK_SIZE_P2 - 1) // BLOCK_SIZE_P2
         num_threads = BLOCK_DIM_P2
         warp = tid >> 5
         lane = tid & 31
@@ -400,7 +457,7 @@ class PlanningKernel:
         )
 
         # 1a
-        for vb in cutlass.range(pid, num_vblocks, num_sms):
+        for vb in cutlass.range(pid, nvb_rt, num_sms):
             for e in cutlass.range(tid, E, num_threads):
                 s_histogram[e] = 0
 
@@ -409,7 +466,7 @@ class PlanningKernel:
             chunk = vb * BLOCK_SIZE_P2
             for p in cutlass.range(tid, BLOCK_SIZE_P2, num_threads):
                 off = chunk + p
-                if off < N:
+                if off < n_rt:
                     expert = topk_in[off]
                     cute.arch.atomic_add(elem_ptr(s_histogram, expert), 1, scope="cta")
 
@@ -426,8 +483,8 @@ class PlanningKernel:
         e_lo = pid * experts_per_block
         e_hi = cutlass.min(e_lo + experts_per_block, E)
         for e in cutlass.range(e_lo + tid, e_hi, num_threads):
-            cumsum = 0
-            for vb in cutlass.range_constexpr(num_vblocks):
+            cumsum = Int32(0)
+            for vb in cutlass.range(nvb_rt):
                 v = vblocks_histogram[vb, e]
                 vblocks_histogram[vb, e] = cumsum
                 cumsum += v
@@ -439,7 +496,7 @@ class PlanningKernel:
         cute.arch.barrier()
         warp_exclusive_scan_e(s_histogram, E, tid)
         lanes_lt = (Uint32(1) << lane) - Uint32(1)
-        for vb in cutlass.range(pid, num_vblocks, num_sms):
+        for vb in cutlass.range(pid, nvb_rt, num_sms):
             chunk = vb * BLOCK_SIZE_P2
             my_e = []; my_p = []
             for i in cutlass.range_constexpr(IPT):
@@ -447,7 +504,7 @@ class PlanningKernel:
                 off = chunk + p
                 my_p.append(p)
                 ev = E
-                if off < N:
+                if off < n_rt:
                     ev = topk_in[off]
                 my_e.append(ev)
 
@@ -494,12 +551,17 @@ class PlanningKernel:
 
     @cute.kernel
     def kernel(self, tpe, topk, meta, mc, dst, cu_seqlens,
-               experts_to_copy, zfr, remote_stats, alloc, group_tokens, z, lh, bar,
-               rank: Int32):
+               experts_to_copy, zfr, remote_stats, alloc, group_tokens, rank_tokens,
+               z, lh, bar,
+               rank: Int32, num_tokens: Int32, total_tokens: Int32, uniform: Int32):
         R = cutlass.const_expr(self.R)
         E = cutlass.const_expr(self.E)
-        S = cutlass.const_expr(self.S)
         K = cutlass.const_expr(self.K)
+        # Runtime extents of this step: n_rt valid top-k entries on this rank
+        # (<= compile time capacity N, which still sizes every buffer). Ranks
+        # may differ in n_rt; the per-rank receive caps are derived by rank 0
+        # from the gathered tpe (see the balancer below), never from n_rt.
+        n_rt = num_tokens * K
         epn = cutlass.const_expr(E // R)
         LOG2_R = cutlass.const_expr(log2_r(R))
         EB_PAD = cutlass.const_expr(ceil_pow2(2 * epn))
@@ -507,7 +569,6 @@ class PlanningKernel:
         ms = cutlass.const_expr(self.meta_stride)
         N = cutlass.const_expr(self.N)
         NvS = cutlass.const_expr(self.NvS)
-        CAP = cutlass.const_expr(self.NvS_capacity)
         tp = cutlass.const_expr(self.token_padding)
         num_sms = cutlass.const_expr(self.num_sms)
         TPE_OFF = cutlass.const_expr(self.TPE_OFF)
@@ -571,14 +632,31 @@ class PlanningKernel:
         s_col = sa(E)
         s_chosen = sa(epn)
         s_wmax = sa(64)
+        # Dedicated block-reduction scalars (never reused, see block_sum_i32).
+        s_tpe_sum = sa(1)
+        s_tpe0_sum = sa(1)
+        s_total_sum = sa(1)
         bar_p = bar.iterator
+        # Local s/tpe contract check: tokens_per_expert must describe exactly
+        # the num_tokens*K top-k entries this rank passed. Violations would
+        # corrupt every peer's plan, so fail fast here (trap) instead.
+        if pid == 0:
+            tpe_total = block_sum_i32(tpe, E, s_tpe_sum, tid, num_threads)
+            if tid == 0:
+                if tpe_total != n_rt:
+                    cute.printf(
+                        "MoonEP planning: rank %d tokens_per_expert sums to %d entries "
+                        "but num_tokens*K = %d\n",
+                        rank, tpe_total, n_rt,
+                    )
+                    device_trap()
         # Phase A
         # tpe gather -> rank0 chunk (helper handles head/tail alignment itself)
         copy_v4_remote(meta, TPE_OFF + rank * E, tpe, E, pid, tid, num_threads, num_sms)
         if cutlass.const_expr(R > 1):
             if rank == 0:
                 # The TOPK0/TPE region of alloc is guaranteed 16B aligned: topk/tpe push goes v4 (tail padded internally).
-                copy_v4_remote(meta, ms + TOPK0_OFF, topk, N, pid, tid, num_threads, num_sms)
+                copy_v4_remote(meta, ms + TOPK0_OFF, topk, n_rt, pid, tid, num_threads, num_sms)
                 copy_v4_remote(meta, ms + TPE_OFF, tpe, E, pid, tid, num_threads, num_sms)
         cross_rank_barrier(meta, ms, BARRIER_OFF, rank, R, bar_p, num_sms, num_threads, tid)
         if rank == 0:
@@ -594,6 +672,7 @@ class PlanningKernel:
                 pid * num_threads + tid, R, num_sms * num_threads
             ):
                 group_tokens[i] = 0
+                rank_tokens[i] = 0
             grid_sync(bar_p, num_sms, tid)
             # Split the expert dimension across blocks; S1_TILE alignment keeps
             # each round processing a fixed number of columns.
@@ -623,6 +702,16 @@ class PlanningKernel:
 
                 cute.arch.barrier()
 
+                # Per-source-rank totals n_r = sum_e tpe[r, e] (columns past
+                # end_idx were zero-filled above). Must run before the column
+                # prefix below overwrites s_tpe in place.
+                if tid < R:
+                    acc = Int32(0)
+                    for col in cutlass.range(S1_COLS):
+                        acc += s_tpe[tid, col]
+                    cute.arch.atomic_add(rank_tokens.iterator + tid, acc, scope="gpu")
+                cute.arch.barrier()
+
                 if tid < S1_COLS:
                     expert_idx = e0 + tid
                     if expert_idx < end_idx:
@@ -645,14 +734,60 @@ class PlanningKernel:
             if pid == 0:
                 if tid < 32:
                     lane = tid
-                    # balance stays in registers throughout: lane holds
-                    # bal[j]=group_tokens[lane+j*32]-CAP, CHUNK=ceil(R/32).
                     CHUNK = cutlass.const_expr(ceil_div(R, 32))
+                    # Per-source-rank entry counts n_k = sum_e tpe[k, e] and
+                    # the step total total_slots = sum_k n_k, all in registers.
+                    rank_n = cute.make_rmem_tensor(CHUNK, Int32)
+                    total_slots = Int32(0)
+                    for j in cutlass.range_constexpr(CHUNK):
+                        k = lane + j * 32
+                        rank_n[j] = 0
+                        if k < R: rank_n[j] = rank_tokens[k]
+                        total_slots += rank_n[j]
+                    total_slots = cute.arch.warp_redux_sync(total_slots, "add")
+                    # Cross-rank s/tpe contract checks (rank 0 sees every tpe). The
+                    # uniform-mode check runs first so a differing s prints the
+                    # message that names the rank and the total_num_tokens remedy.
+                    if uniform != 0:
+                        for j in cutlass.range_constexpr(CHUNK):
+                            k = lane + j * 32
+                            if k < R:
+                                if rank_n[j] != n_rt:
+                                    cute.printf(
+                                        "MoonEP planning: rank %d passed %d top-k entries but "
+                                        "rank 0 passed %d; every rank must pass the same "
+                                        "num_tokens, or pass total_num_tokens to dispatch for "
+                                        "per-rank token counts\n",
+                                        k, rank_n[j], n_rt,
+                                    )
+                                    device_trap()
+                    if total_slots != total_tokens * K:
+                        if lane == 0:
+                            cute.printf(
+                                "MoonEP planning: tokens across ranks sum to %d entries "
+                                "but total_num_tokens*K = %d\n",
+                                total_slots, total_tokens * K,
+                            )
+                            device_trap()
+                    # balance stays in registers throughout: lane holds
+                    # bal[j]=group_tokens[lane+j*32]-cap_k, CHUNK=ceil(R/32).
+                    # Receive caps split total_slots evenly: cap_k = base + 1
+                    # for the first rem ranks, base otherwise, so
+                    # sum_k cap_k == total_slots == sum_k group_tokens[k] and
+                    # balancing terminates with every rank at exactly cap_k.
+                    # cap_k <= ceil(total_tokens*K / R) = host recv_cap, so the
+                    # padded layout fits in plan.nvs_s <= NvS. With uniform s
+                    # this is cap_k = s*K on every rank.
+                    base_cap = total_slots // R
+                    rem_cap = total_slots - base_cap * R
                     balance = cute.make_rmem_tensor(CHUNK, Int32)
                     for j in cutlass.range_constexpr(CHUNK):
                         k = lane + j * 32
                         balance[j] = 0
-                        if k < R: balance[j] = group_tokens[k] - CAP
+                        if k < R:
+                            cap_k = base_cap
+                            if k < rem_cap: cap_k = base_cap + 1
+                            balance[j] = group_tokens[k] - cap_k
                     keep_balancing = True
                     while keep_balancing:
                         # surplus takes max (larger balance first, smaller rank
@@ -664,7 +799,7 @@ class PlanningKernel:
                             keep_balancing = False
                         else:
                             # The move amount is limited by the receiver's
-                            # shortfall; refill deficit_rank back to CAP in one shot.
+                            # shortfall; refill deficit_rank back to cap_k in one shot.
                             move_tokens = -deficit
                             for j in cutlass.range_constexpr(CHUNK):
                                 k = lane + j * 32
@@ -923,15 +1058,21 @@ class PlanningKernel:
         order = cute.make_tensor(meta.iterator + (rank * ms + ORDER_OFF), cute.make_layout((N,)))
         if cutlass.const_expr(R > 1):
             if rank != 0:
-                self.run_c1(topk, order, tpe, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid)
+                self.run_c1(topk, order, tpe, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid, n_rt)
                 if rank == 1:
+                    # Rank 1 also orders rank 0's top-k (offloaded above).
+                    # Rank 0 may have a different token count: derive its
+                    # n_rt_0 from its tpe copy (rank 0 trapped above if that
+                    # sum did not match its own num_tokens*K). Every block
+                    # reduces on its own; no cross-block sync needed.
                     tk0 = cute.make_tensor(meta.iterator + (rank * ms + TOPK0_OFF), cute.make_layout((N,)))
                     tp0 = cute.make_tensor(meta.iterator + (rank * ms + TPE_OFF), cute.make_layout((E,)))
                     order0 = cute.make_tensor(meta.iterator + (rank * ms + ORDER0_OFF), cute.make_layout((N,)))
-                    self.run_c1(tk0, order0, tp0, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid)
-                    copy_v4_remote(meta, ORDER_OFF, order0, N, pid, tid, num_threads, num_sms)
+                    n_rt_0 = block_sum_i32(tp0, E, s_tpe0_sum, tid, num_threads)
+                    self.run_c1(tk0, order0, tp0, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid, n_rt_0)
+                    copy_v4_remote(meta, ORDER_OFF, order0, n_rt_0, pid, tid, num_threads, num_sms)
         else:
-            self.run_c1(topk, order, tpe, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid)
+            self.run_c1(topk, order, tpe, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid, n_rt)
         # Clear this rank's src_info slice before all ranks publish fresh slot
         # provenance into destination-rank slices below. src_info mirrors dst's
         # rank-stride encoding: src_rank * NvS + offv; -1 is the empty-slot
@@ -939,6 +1080,27 @@ class PlanningKernel:
         for idx in cutlass.range(pid * num_threads + tid, NvS, num_sms * num_threads):
             meta[rank * ms + SRC_INFO_OFF + idx] = Int32(-1)
         cross_rank_barrier(meta, ms, BARRIER_OFF, rank, R, bar_p, num_sms, num_threads, tid)
+        # Every rank now holds the multicast PLAN region; row R-1 of tpe_cumsum
+        # is the step's per-expert total. Cross-check this rank's host
+        # total_tokens against it: the host sized plan.nvs_s from that value,
+        # so a rank whose caller passed a different total_num_tokens would
+        # otherwise return views shorter than its cu_seqlens[-1]. Rank 0 already
+        # checked this in the balancer; the other ranks only see it here.
+        if pid == 0:
+            tpe_step_total = cute.make_tensor(
+                meta.iterator + (rank * ms + PLAN_OFF + TPE_SUB + (R - 1) * E),
+                cute.make_layout((E,)),
+            )
+            step_slots = block_sum_i32(tpe_step_total, E, s_total_sum, tid, num_threads)
+            if tid == 0:
+                if step_slots != total_tokens * K:
+                    cute.printf(
+                        "MoonEP planning: rank %d passed total_num_tokens*K = %d but the "
+                        "step has %d top-k entries across ranks; total_num_tokens must be "
+                        "identical on every rank\n",
+                        rank, total_tokens * K, step_slots,
+                    )
+                    device_trap()
         s_expoff = cute.make_tensor(s_hist.iterator, cute.make_layout((E,)))
         for e in cutlass.range(tid, E, num_threads):
             s_expoff[e] = tpe[e]
@@ -1013,8 +1175,8 @@ class PlanningKernel:
             _pd_issue_g2s(meta, s_pd_zfr_stage, zfr_src_begin, zfr_copy_count, pd_mbar)
             _pd_issue_g2s(meta, s_pd_etc_stage, etc_src_begin, etc_copy_count, pd_mbar)
         cute.arch.barrier()
-        seg = cute.ceil_div(N, num_sms)
-        sbeg = pid * seg; send = cutlass.min(sbeg + seg, N)
+        seg = cute.ceil_div(n_rt, num_sms)
+        sbeg = pid * seg; send = cutlass.min(sbeg + seg, n_rt)
         for base in cutlass.range(sbeg + tid, send, num_threads * ITEMS_PER_THREAD_P2):
             for i in cutlass.range_constexpr(ITEMS_PER_THREAD_P2):
                 idx = base + i * BLOCK_DIM_P2
@@ -1048,8 +1210,8 @@ class PlanningKernel:
         # destination rank stays non-negative and copies the payload; later
         # entries encode -raw_dst - 1 and only carry weights. Fresh dispatch
         # materializes the dedup structures from src_info.
-        seg_dst = cute.ceil_div(S, num_sms)
-        sbeg_dst = pid * seg_dst; send_dst = cutlass.min(sbeg_dst + seg_dst, S)
+        seg_dst = cute.ceil_div(num_tokens, num_sms)
+        sbeg_dst = pid * seg_dst; send_dst = cutlass.min(sbeg_dst + seg_dst, num_tokens)
         for base in cutlass.range(sbeg_dst + tid, send_dst, num_threads):
             s = base
             base_idx = s * K
@@ -1111,12 +1273,62 @@ def _get_compiled(R, E, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                        TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
                        token_padding, num_sms)
     i32 = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
+    # 15 tensor pointers (tpe, topk, meta, mc, dst, cu_seqlens, experts_to_copy,
+    # zero_fill, remote_stats, alloc, group_tokens, rank_tokens, z, local_hist,
+    # bar), then rank, num_tokens, total_tokens, uniform, stream.
     return cute.compile(k, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32,
-                        i32, i32, i32, i32, Int32(0), cuda.CUstream(0))
+                        i32, i32, i32, i32, i32,
+                        Int32(0), Int32(0), Int32(0), Int32(0), cuda.CUstream(0))
+
+
+def _aligned16_i32(t, name):
+    """Return ``t`` as a contiguous int32 tensor whose data_ptr is 16B aligned.
+
+    The kernel pointers are declared ``assumed_align=16`` and the Phase A copies
+    read the top-k / tpe in 16B vectors, so a user tensor that is a slice or
+    view at an odd offset (e.g. ``topk[:, 1:]`` or a sub-slice of a pinned
+    arena) must be copied first. Fresh torch allocations are always >= 16B
+    aligned, so the clone satisfies the requirement.
+    """
+    assert t.dtype == torch.int32, f"{name} must be int32, got {t.dtype}"
+    if not t.is_contiguous() or t.data_ptr() % 16 != 0:
+        # one fresh allocation: contiguous and allocator-aligned (>= 16B)
+        t = t.clone(memory_format=torch.contiguous_format)
+    return t
+
+
+def _rank_tokens_buffer(ctx):
+    """Per-source-rank entry totals scratch (R int32), zeroed by the kernel.
+
+    Allocated like ``ctx['group_tokens']`` (api.py local temps) when the Buffer
+    provides it; otherwise created once here and cached in ``ctx`` so older
+    Buffers keep working without re-allocating per step.
+    """
+    rt = ctx.get('rank_tokens')
+    if rt is None:
+        rt = torch.empty(int(ctx['R']), dtype=torch.int32, device=ctx['meta_buf'].device)
+        ctx['rank_tokens'] = rt
+    return rt
 
 
 def _launch_planning_kernel(ctx, topk, tpe, dst, cu_seqlens,
-                            experts_to_copy, zero_fill_ranges, remote_stats):
+                            experts_to_copy, zero_fill_ranges, remote_stats,
+                            num_tokens, total_tokens, uniform):
+    assert 0 < int(num_tokens) <= int(ctx['S']), (
+        f"num_tokens must be in [1, S={int(ctx['S'])}], got {num_tokens}"
+    )
+    assert int(num_tokens) <= int(total_tokens) <= int(ctx['R']) * int(ctx['S']), (
+        f"total_num_tokens must be in [num_tokens={int(num_tokens)}, "
+        f"R*S={int(ctx['R']) * int(ctx['S'])}], got {total_tokens}"
+    )
+    # The kernel reduces per-rank totals with one thread per rank (tid < R) and
+    # the cross-rank barrier needs the same.
+    assert int(ctx['R']) <= BLOCK_DIM_P2, (
+        f"planning requires R <= {BLOCK_DIM_P2} (one thread per rank), got R={int(ctx['R'])}"
+    )
+    topk = _aligned16_i32(topk, "topk_experts_flat")
+    tpe = _aligned16_i32(tpe, "tokens_per_expert")
+    rank_tokens = _rank_tokens_buffer(ctx)
     comp = _get_compiled(
         int(ctx['R']),
         int(ctx['E']),
@@ -1153,10 +1365,14 @@ def _launch_planning_kernel(ctx, topk, tpe, dst, cu_seqlens,
         p4(remote_stats),
         p16(ctx['alloc']),
         p16(ctx['group_tokens']),
+        p16(rank_tokens),
         p16(ctx['z']),
         p16(ctx['local_hist']),
         p16(ctx['grid_sync_bar']),
         Int32(int(ctx['rank'])),
+        Int32(int(num_tokens)),
+        Int32(int(total_tokens)),
+        Int32(1 if uniform else 0),
         stream,
     )
 
@@ -1165,19 +1381,67 @@ def _round4(n):
     return (n + 3) & ~3
 
 
-def allocate_planning_outputs(ctx: dict):
+def planning_recv_cap(ctx: dict, total_num_tokens: int) -> int:
+    """Per-rank receive cap ``ceil(total_num_tokens * K / R)`` of a step.
+
+    The planner hands every rank either ``total_slots // R`` or one more slot
+    (``total_slots = total_num_tokens * K``), so this bounds the real rows of
+    any rank's shard; ``planning_nvs_s`` adds the segment padding.
+    """
+    return ceil_div(int(total_num_tokens) * int(ctx['K']), int(ctx['R']))
+
+
+def planning_nvs_s(ctx: dict, total_num_tokens: int) -> int:
+    """Rows of every rank's NvS shard that one step's dispatch may write.
+
+    ``recv_cap + token_padding_extra`` rounded up to ``token_padding``, the same
+    rounding ``NvS`` itself gets, so the step-sized ``[nvs_s, H]`` views keep a
+    token_padding-aligned row count for fixed-tile consumers. It never exceeds
+    ``NvS``: ``recv_cap <= S*K`` because ``total_num_tokens <= R*S``.
+    """
+    tp = int(ctx['token_padding'])
+    nvs_s = planning_recv_cap(ctx, total_num_tokens) + int(ctx['token_padding_extra'])
+    nvs_s = (nvs_s + tp - 1) // tp * tp
+    assert nvs_s <= int(ctx['NvS']), (
+        f"nvs_s={nvs_s} for total_num_tokens={total_num_tokens} exceeds NvS={int(ctx['NvS'])}"
+    )
+    return nvs_s
+
+
+def allocate_planning_outputs(
+    ctx: dict,
+    num_tokens: int | None = None,
+    total_num_tokens: int | None = None,
+):
     """Allocate a ``(MoonEPCommPlan, cu_seqlens)`` pair on the current stream.
 
     The plan-owned dedup tensors are allocated here so the returned plan is
     complete, but fresh planning leaves their contents for the dispatch builder
     to materialize.
+
+    Args:
+        num_tokens: this rank's token count this step (``1 <= num_tokens <= S``);
+            None means the Buffer capacity ``S``. The plan's ``N`` becomes
+            ``num_tokens * K`` and sizes ``dst``.
+        total_num_tokens: sum of ``num_tokens`` over all EP ranks; None means
+            every rank passes the same ``num_tokens`` (``R * num_tokens``).
+            Sizes the receive side: ``plan.nvs_s = planning_nvs_s(ctx,
+            total)``.
     """
-    E = ctx['E']
-    epn = E // ctx['R']
-    S = ctx['S']
-    K = ctx['K']
-    N = S * K
-    NvS = ctx['NvS']
+    E = int(ctx['E'])
+    S = int(ctx['S'])
+    K = int(ctx['K'])
+    R = int(ctx['R'])
+    epn = E // R
+    s = S if num_tokens is None else int(num_tokens)
+    assert 0 < s <= S, f"num_tokens must be in [1, S={S}], got {s}"
+    total = R * s if total_num_tokens is None else int(total_num_tokens)
+    assert s <= total <= R * S, (
+        f"total_num_tokens must be in [num_tokens={s}, R*S={R * S}], got {total}"
+    )
+    N = s * K
+    NvS = int(ctx['NvS'])
+    nvs_s = planning_nvs_s(ctx, total)
     dev = ctx['meta_buf'].device
 
     # CuTe DSL kernel grid-stride writes get vectorized (up to 4×int32 = 16B).
@@ -1207,10 +1471,11 @@ def allocate_planning_outputs(ctx: dict):
         dup_loffs=dup_loffs,
         dup_counts=dup_counts,
         N=N,
-        R=ctx['R'],
+        R=R,
         E=E,
         NvS=NvS,
         K=K,
+        nvs_s=nvs_s,
     )
     return plan, cu_seqlens
 
@@ -1219,7 +1484,15 @@ def _check_planning_outputs(ctx: dict, cu_seqlens, plan) -> None:
     assert isinstance(plan, MoonEPCommPlan)
     E = ctx['E']
     epn = E // ctx['R']
-    assert plan.N == ctx['S'] * ctx['K']
+    K = int(ctx['K'])
+    # plan.N = num_tokens * K for this step; S * K is only the capacity bound.
+    assert plan.N % K == 0 and 0 < plan.N <= int(ctx['S']) * K, (
+        f"plan.N must be num_tokens * K with 1 <= num_tokens <= S={int(ctx['S'])}, "
+        f"got N={plan.N}, K={K}"
+    )
+    assert 0 < int(plan.nvs_s) <= int(ctx['NvS']), (
+        f"plan.nvs_s must be in [1, NvS={int(ctx['NvS'])}], got {plan.nvs_s}"
+    )
     assert plan.R == ctx['R']
     assert plan.E == E
     assert plan.NvS == ctx['NvS']
@@ -1261,6 +1534,8 @@ def launch_planning(
     tokens_per_expert,
     cu_seqlens,
     plan,
+    *,
+    total_num_tokens: int | None = None,
 ) -> None:
     """Run the planning kernel; may reuse caller-allocated output objects.
 
@@ -1269,12 +1544,42 @@ def launch_planning(
     The plan-owned dedup structures are materialized in the fresh dispatch
     builder; the reuse path with an existing plan reuses these tensors
     directly.
+
+    Args:
+        total_num_tokens: sum over all EP ranks of this step's ``num_tokens``
+            (host-known). None means every rank passes the same
+            ``plan.num_tokens``; the kernel verifies that on device and traps
+            the offending rank otherwise. Must match the value the plan was
+            allocated with (``plan.nvs_s``).
+
+    Contract violations (``tokens_per_expert`` not summing to ``num_tokens*K``,
+    per-rank totals not summing to ``total_num_tokens*K``, or differing token
+    counts in uniform mode) trap the planning kernel on the detecting rank; the
+    peers then hang at the next cross-rank barrier until torchrun kills them.
     """
     _check_planning_outputs(ctx, cu_seqlens, plan)
     _check_dedup_encoding_bounds(ctx)
+    assert topk_experts_flat.numel() == plan.N, (
+        f"topk_experts_flat must have plan.N={plan.N} entries "
+        f"(num_tokens*K), got {topk_experts_flat.numel()}"
+    )
+    assert tokens_per_expert.numel() == int(ctx['E']), (
+        f"tokens_per_expert must have E={int(ctx['E'])} entries, got {tokens_per_expert.numel()}"
+    )
+    uniform = total_num_tokens is None
+    total = int(ctx['R']) * plan.num_tokens if uniform else int(total_num_tokens)
+    expected_nvs_s = planning_nvs_s(ctx, total)
+    assert int(plan.nvs_s) == expected_nvs_s, (
+        f"plan.nvs_s={plan.nvs_s} does not match total_num_tokens={total} "
+        f"(expected {expected_nvs_s}: ceil({total}*{int(ctx['K'])}/{int(ctx['R'])}) + "
+        f"token_padding_extra={int(ctx['token_padding_extra'])}, rounded up to "
+        f"token_padding={int(ctx['token_padding'])}); "
+        "allocate the plan with the same total_num_tokens"
+    )
 
     _launch_planning_kernel(
         ctx, topk_experts_flat, tokens_per_expert,
         plan.dst, cu_seqlens, plan.experts_to_copy,
         plan.zero_fill_ranges, plan.remote_stats,
+        plan.num_tokens, total, uniform,
     )

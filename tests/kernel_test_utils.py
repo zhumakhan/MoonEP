@@ -77,13 +77,40 @@ def skip_if_unsupported_world_size(case, R):
         pytest.skip(f"case {case.name} requires R <= {case.max_R}, got R={R}")
 
 
-def make_topk(case, rank, R):
+def expected_nvs_s(ctx, total_num_tokens):
+    """``plan.nvs_s`` for a step whose token counts sum to ``total_num_tokens``
+    over the EP ranks: the receive cap ceil(total*K / R) plus the worst-case
+    segment padding, rounded up to token_padding like NvS. Computed here
+    independently of ``moonep.planning.planning_nvs_s`` so tests check it."""
+    K, R = int(ctx["K"]), int(ctx["R"])
+    tp = int(ctx["token_padding"])
+    rows = -(-int(total_num_tokens) * K // R) + int(ctx["token_padding_extra"])
+    return _align_up(rows, tp)
+
+
+def partial_token_counts(S):
+    """The partial-step sizes the unit tests plan on a Buffer of capacity S:
+    one token, half the capacity and one below it. Callers skip S < 2."""
+    return sorted({1, S // 2, S - 1})
+
+
+def make_topk(case, rank, R, s=None):
+    """Routing for this rank. ``s`` (default ``case.S``) keeps the first ``s``
+    tokens of the full-S routing and recomputes ``tokens_per_expert``, so a
+    partial step routes exactly like the prefix of the full one."""
     skip_if_unsupported_world_size(case, R)
 
     dev = "cuda"
     E = case.E(R)
     if case.K > E and case.routing in {"balanced", "biased"}:
         pytest.skip(f"case {case.name} requires K <= E, got K={case.K}, E={E}")
+
+    if s is not None:
+        assert 0 < int(s) <= case.S, f"num_tokens {s} outside [1, S={case.S}]"
+        topk_full, _ = make_topk(case, rank, R)
+        topk = topk_full[: int(s)].contiguous()
+        tpe = torch.bincount(topk.flatten(), minlength=E).to(torch.int32)
+        return topk, tpe
 
     if case.routing in {"balanced", "biased"}:
         bias = case.bias_ratio if case.routing == "biased" else 0.0
@@ -321,16 +348,35 @@ def assert_ulp_all_ranks(name, actual, expected, rank, R, max_ulps=1):
     )
 
 
-def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
+def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy,
+                              num_tokens=None, nvs_s=None):
+    """Structural checks on one rank's planning outputs.
+
+    ``num_tokens`` is this rank's ``s`` for the step (default ``case.S``);
+    ``nvs_s`` is ``plan.nvs_s``, the number of rows of this rank's NVL shard
+    dispatch may write this step. Only the local rank's ``nvs_s`` is known,
+    so the bound is checked on ``cu_seqlens[-1]`` and on every decoded local
+    offset whose destination is this rank; slots bound for other ranks are
+    only checked against the capacity ``NvS``."""
     errors = []
+    rank = int(ctx["rank"])
     R = int(ctx["R"])
     E = int(ctx["E"])
     epn = E // R
     NvS = int(ctx["NvS"])
-    N = case.S * case.K
+    # Meta layout (TOPK0/ORDER/ORDER0/BARRIER/SRC_INFO offsets) is sized by the
+    # Buffer's capacity S, independent of how many tokens this step plans.
+    N_capacity = case.S * case.K
+    s = case.S if num_tokens is None else int(num_tokens)
+    assert 0 < s <= case.S, f"num_tokens {s} outside [1, S={case.S}]"
+    N = s * case.K  # this step's dst length
+    if nvs_s is not None:
+        nvs_s = int(nvs_s)
+        if not (0 < nvs_s <= NvS):
+            errors.append(f"nvs_s={nvs_s} outside (0, NvS={NvS}]")
 
     expected_nvs = _align_up(
-        N + (case.token_padding - 1) * 2 * case.epn,
+        N_capacity + (case.token_padding - 1) * 2 * case.epn,
         case.token_padding,
     )
     if NvS != expected_nvs:
@@ -343,7 +389,7 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
         + R * epn
         + 2 * R
     )
-    n4 = _align_up(N, 4)
+    n4 = _align_up(N_capacity, 4)
     expected_topk0_off = _align_up(int(ctx["PLAN_OFF"]) + planning_out_elems, 4)
     expected_order_off = expected_topk0_off + n4
     expected_order0_off = expected_order_off + n4
@@ -367,7 +413,10 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
         )
 
     if dst.dtype != torch.int32 or tuple(dst.shape) != (N,):
-        errors.append(f"dst must be int32 [{N}], got {dst.dtype} {tuple(dst.shape)}")
+        errors.append(
+            f"dst must be int32 [{N}] (num_tokens={s} * K={case.K}), "
+            f"got {dst.dtype} {tuple(dst.shape)}"
+        )
     else:
         dst_cpu = dst.cpu()
         raw_dst = torch.where(dst_cpu < 0, -dst_cpu - 1, dst_cpu)
@@ -377,6 +426,14 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
             errors.append("dst contains an out-of-range destination rank")
         if not torch.all((local_off >= 0) & (local_off < NvS)):
             errors.append("dst contains an out-of-range local offset")
+        if nvs_s is not None:
+            to_self = dest_rank == rank
+            if bool((local_off[to_self] >= nvs_s).any()):
+                worst = int(local_off[to_self].max().item())
+                errors.append(
+                    f"dst sends a slot to local offset {worst} >= nvs_s={nvs_s} "
+                    f"on rank {rank}"
+                )
 
     cu_cpu = cu_seqlens.cpu()
     if cu_seqlens.dtype != torch.int32 or tuple(cu_seqlens.shape) != (2 * epn,):
@@ -401,6 +458,10 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
             prev = cur
         if int(cu_cpu[-1].item()) > NvS:
             errors.append(f"cu_seqlens total {int(cu_cpu[-1].item())} exceeds NvS={NvS}")
+        elif nvs_s is not None and int(cu_cpu[-1].item()) > nvs_s:
+            errors.append(
+                f"cu_seqlens total {int(cu_cpu[-1].item())} exceeds nvs_s={nvs_s}"
+            )
 
     copy_cpu = experts_to_copy.cpu()
     if experts_to_copy.dtype != torch.int32 or tuple(experts_to_copy.shape) != (R, epn):

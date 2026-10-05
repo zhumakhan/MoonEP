@@ -147,10 +147,10 @@ class DispatchKernel:
     @cute.jit
     def __call__(
         self,
-        hidden_sh_ptr: cute.Pointer,          # bf16 [S, H]
+        hidden_sh_ptr: cute.Pointer,          # bf16 [s, H]; s = num_tokens <= S (layout declared at capacity S)
         hidden_buf_ptr: cute.Pointer,         # bf16 [R*NvS_padded, H]
-        weights_ptr: cute.Pointer,            # int32 view of fp32 [S, K] (or placeholder)
-        dst_ptr: cute.Pointer,                # int32 [N=S*K]
+        weights_ptr: cute.Pointer,            # int32 view of fp32 [s, K] (or placeholder)
+        dst_ptr: cute.Pointer,                # int32 [N=s*K]
         meta_ptr: cute.Pointer,               # int32 [R*meta_stride]
         zero_fill_ranges_ptr: cute.Pointer,   # int32 [2*epn, 2] (col0=pad_start, col1=n_pad)
         bar_ptr: cute.Pointer,                # int32 [1] grid barrier counter
@@ -164,6 +164,7 @@ class DispatchKernel:
         rank: Int32,
         weights_off: Int32,
         barrier_off: Int32,
+        num_tokens: Int32,                    # this step's tokens on this rank (s), 1 <= s <= S
         stream: cuda.CUstream,
     ):
         H = cutlass.const_expr(self.H)
@@ -195,7 +196,9 @@ class DispatchKernel:
         meta_tensor = cute.make_tensor(
             meta_ptr, cute.make_layout((R * meta_stride,))
         )
-        # weights: int32 view of fp32 [S, K] when with_weights, else placeholder.
+        # weights: int32 view of fp32 [s, K] when with_weights, else placeholder.
+        # The layout is declared at capacity S*K; only the first s*K entries
+        # are ever indexed (per-block token ranges stop at num_tokens).
         if cutlass.const_expr(self.with_weights):
             w_tensor = cute.make_tensor(
                 weights_ptr, cute.make_layout((S * K,))
@@ -255,6 +258,7 @@ class DispatchKernel:
             rank,
             weights_off,
             barrier_off,
+            num_tokens,
         ).launch(
             grid=(self.num_sms, 1, 1),
             block=(self.num_threads, 1, 1),
@@ -285,6 +289,7 @@ class DispatchKernel:
         rank: Int32,
         weights_off: Int32,
         barrier_off: Int32,
+        num_tokens: Int32,
     ):
         R = cutlass.const_expr(self.R)
         H = cutlass.const_expr(self.H)
@@ -348,10 +353,12 @@ class DispatchKernel:
         cute.arch.fence_view_async_shared()
         cute.arch.barrier()
 
-        # ----- per-block token range
-        tpb = (S + self.num_sms - 1) // self.num_sms
+        # ------ per-block token range over this step's num_tokens (<= S).
+        # When num_tokens < num_sms, trailing block start past the end;
+        # clamp so n_tok never goes negative
+        tpb = (num_tokens + self.num_sms - 1) // self.num_sms
         s_beg = bidx * tpb
-        s_end = cutlass.min(s_beg + tpb, S)
+        s_end = cutlass.max(cutlass.min(s_beg + tpb, num_tokens), s_beg)
         n_tok = s_end - s_beg
 
         # ============================================
@@ -754,6 +761,7 @@ def _get_compiled(
         Int32(0),  # rank
         Int32(0),  # weights_off
         Int32(0),  # barrier_off
+        Int32(0),  # num_tokens
         stream_arg,
     )
 
@@ -787,14 +795,20 @@ def _check_dedup_builder_bounds(ctx: dict) -> None:
 def _check_dispatch_plan(ctx: dict, hidden_sh: torch.Tensor, plan: MoonEPCommPlan) -> None:
     S = int(ctx['S'])
     K = int(ctx['K'])
-    N = S * K
     R = int(ctx['R'])
     E = int(ctx['E'])
     epn = E // R
     NvS = int(ctx['NvS'])
     dev = hidden_sh.device
 
-    assert plan.N == N, f"plan.N must be S*K={N}, got {plan.N}"
+    # plan.N = num_tokens*K for the step this plan was made for; the Buffer's
+    # S*K is only the capacity bound.
+    num_tokens = int(hidden_sh.shape[0])
+    N = int(plan.N)
+    assert 0 < num_tokens <= S, f"num_tokens must be in [1, S={S}], got {num_tokens}"
+    assert N == num_tokens * K, (
+        f"plan.N must equal hidden_sh rows*K={num_tokens * K}, got {N}"
+    )
     assert plan.R == R, f"plan.R must match ctx R={R}, got {plan.R}"
     assert plan.K == K, f"plan.K must match ctx K={K}, got {plan.K}"
     assert plan.NvS == NvS, f"plan.NvS must match ctx NvS={NvS}, got {plan.NvS}"
@@ -847,8 +861,9 @@ def launch_dispatch(
     """Launch the dispatch kernel.
 
     Args:
-        hidden_sh: [S, H] bf16 source hidden states.
-        route_weights_sk: [S, K] fp32 route weights, or None to skip the
+        hidden_sh: [s, H] bf16 source hidden states, 1 <= s <= S (the Buffer capacity);
+            s must be equal ``plan.num_tokens``.
+        route_weights_sk: [s, K] fp32 route weights, or None to skip the
             weights scatter (placeholder tensor is passed to satisfy the
             non-null pointer constraint; the kernel ignores it when
             with_weights=False).
@@ -882,8 +897,19 @@ def launch_dispatch(
     assert hidden_sh.dtype == torch.bfloat16 and hidden_sh.is_contiguous(), \
         "hidden_sh must be contiguous bf16"
     assert hidden_sh.is_cuda, "hidden_sh must be a CUDA tensor"
-    assert tuple(hidden_sh.shape) == (S, H), \
-        f"hidden_sh must be shape [S={S}, H={H}], got {tuple(hidden_sh.shape)}"
+    # cp.async.bulk rows and the assumed_align=16 pointer both need a 16-byte
+    # aligned base (rows are 16-byte multiples because H % 8 == 0).
+    assert hidden_sh.data_ptr() % 16 == 0, (
+        "hidden_sh must be 16-byte aligned (the dispatch kernel uses "
+        "assumed_align=16 / cp.async.bulk); re-materialize mid-batch slices "
+        "with .contiguous().clone()"
+    )
+
+    assert hidden_sh.ndim == 2 and int(hidden_sh.shape[1]) == H \
+        and 0 < int(hidden_sh.shape[0]) <= S, \
+            f"hidden_sh must be shape [s, H={H}] with 1 <= s <= {S}, got {tuple(hidden_sh.shape)}"
+    num_tokens = int(hidden_sh.shape[0])
+
     _check_dispatch_plan(ctx, hidden_sh, plan)
     assert ctx['hidden_buf'].dtype == torch.bfloat16 and ctx['hidden_buf'].is_contiguous()
     assert ctx['hidden_buf'].device == hidden_sh.device
@@ -895,9 +921,17 @@ def launch_dispatch(
     if with_weights:
         assert route_weights_sk.dtype == torch.float32 and route_weights_sk.is_contiguous(), \
             "route_weights_sk must be contiguous fp32"
-        assert tuple(route_weights_sk.shape) == (S, K), \
-            f"route_weights_sk must be shape [S={S}, K={K}], got {tuple(route_weights_sk.shape)}"
+        assert tuple(route_weights_sk.shape) == (num_tokens, K), \
+            f"route_weights_sk must be shape [s={num_tokens}, K={K}], got {tuple(route_weights_sk.shape)}"
         assert route_weights_sk.device == hidden_sh.device
+        # The kernel binds this pointer with assumed_align=16 and issues
+        # vectorized int32 loads; a mid-batch [a:b] row slice of a larger
+        # [S, K] tensor can be contiguous yet only 4-byte aligned.
+        assert route_weights_sk.data_ptr() % 16 == 0, (
+            "route_weights_sk must be 16-byte aligned (the dispatch kernel uses "
+            "assumed_align=16); Buffer.dispatch re-materializes misaligned "
+            "slices, direct callers must pass .contiguous().clone()"
+        )
     assert ctx['H'] % 8 == 0, "H must be multiple of 8 for 16-B bulk-copy alignment"
     if build_dedup_map:
         _check_dedup_builder_bounds(ctx)
@@ -979,5 +1013,6 @@ def launch_dispatch(
         Int32(int(ctx['rank'])),
         Int32(int(ctx['WEIGHTS_OFF'])),
         Int32(int(ctx['BARRIER_OFF'])),
+        Int32(num_tokens),
         stream,
     )
