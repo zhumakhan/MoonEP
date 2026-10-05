@@ -183,6 +183,35 @@ Grep for the identifiers below rather than relying on line numbers.
 - Upstream's removal of `B` also applies to the varlen cases: no
   `KernelCase(B=...)`, no `Buffer(B=...)`, and `cu_seqlens` is `[2*epn]`.
 
+### `my_moon_ep.py` (training example)
+Ported from the old fork to the upstream API:
+- **Memory per projection.**
+  - A bf16 `[2*epn, in, out]` compute view: this rank's own-expert chunk and
+    its prefetch chunk, mapped back to back.
+  - The all-rank prefetch pool `[R, epn, ...]`, pushed into by
+    `prefetch_weight(local_*_weight=w[:epn], *_prefetch_buffer=pool)`.
+  - Plain fp32 `[epn, ...]` expert grads (the masters' `.grad`).
+  - The all-rank fp32 reduce pool, consumed by
+    `reduce_grad(local_*_grad=..., *_reduce_buffer=...)`.
+- **Weight grads.** `_ExpertGroupedMM` takes dW over `cu_seqlens[2*epn]`
+  directly and adds it into the fp32 grads and reduce slots. The old
+  `offs_live` compaction is not needed: the `[2*epn]` layout has no dead
+  groups.
+- **Varlen.** `forward(x, total_num_tokens=None)` takes `[s, H]` for any
+  `s <= S`.
+- **Correctness check.** `main()` first checks a small layer against a dense
+  reference built from the all-gathered experts: output, dx, router grad and
+  expert grads, at `s = S`, `s = 131`, `s = 1` and per-rank `s`. It then times
+  the original training step.
+- **Fixed defects of the old version:** a global RNG reseed in `__init__`, a
+  `last_plan` / `_last_plan` mix-up, and a `reference_grads` that could not
+  run.
+- **Emulated result on `slinky-0`.** All four checks passed: out <= 7e-3,
+  dx <= 1.5e-2, router grad <= 2e-7, expert grads <= 5.5e-3 relative. The
+  E=128 / K=16 / H=4096 / Hi=8192 / S=4096 step took 204.7 ms with AdamW. The
+  bf16 copies matched the masters and the router stayed identical across
+  ranks.
+
 ### `README.md`, `benchmarks/bench_comm.py`
 - The README notation, API bullets and code comments use `[s, ...]` /
   `[plan.nvs_s, ...]`. They describe both modes, the traps, the step-sized
@@ -343,8 +372,7 @@ same emulation. Times are in us.
    - `s = 0` is not supported; pass a dummy token.
    - The multi-node fabric path is untested at any `s`.
    - Contract violations trap instead of raising a cross-rank error.
-5. **Not carried over from the old fork.** The examples (`moe_moon_ep.py`,
-   `my_moon_ep.py`, `moe*.py`, `bench_head2head.py`) and the Megatron-LM
+5. **Not carried over from the old fork.** The other examples
+   (`moe_moon_ep.py`, `moe*.py`, `bench_head2head.py`) and the Megatron-LM
    MoonEP backend still use the pre-`33327eb` API (`[E+B]` composites, pull
-   prefetch, `full_*` tensors). They need a port to `local_*` weights and
-   grads, `*_prefetch_buffer` / `*_reduce_buffer` pools and `cu_seqlens[2*epn]`.
+   prefetch, `full_*` tensors). They need the same port as `my_moon_ep.py`.
