@@ -53,7 +53,7 @@ For each expert projection (gate/up/down), the framework builds two related view
 - **Communication view `[R, epn, H, H']`**: all ranks' prefetch pools mapped directly for `buffer.prefetch_weight`.
 - **Compute view `[2*epn, H, H']`**: rows `[0, epn)` alias this rank's local parameter weights; rows `[epn, 2*epn)` alias this rank's prefetch slice. The VM group GEMM and `cu_seqlens` use this compact row order without mapping the other ranks' parameter weights.
 
-Each rank's prefetch pool is process-global and shared by all layers, so the extra physical cost is `epn` expert weights per projection in total, not per layer.
+Each rank's prefetch pool is process-global and shared by all layers, so the extra physical cost is `epn` expert weights per projection in total, not per layer. `ExpertPools` allocates such shared pools; see [Sharing expert pools across layers](#sharing-expert-pools-across-layers).
 
 Each rank has `epn` prefetch slots. The planner moves experts from at most one remote home group to each destination rank, so these slots cover every remote expert segment.
 
@@ -66,6 +66,36 @@ Training mirrors the compact weight layout in fp32:
 - **Local grad `[epn, H, H']`**: this rank's parameter grads.
 - **Compute grad view `[2*epn, H, H']`**: the local grad followed by this rank's reduce-buffer slice. The tail contains temporary prefetch-slot grads and stays separate from the framework's own parameter-grad reduction.
 - **Reduce buffer**: every rank maps all `R` reduce buffers as one `[R, epn, H, H']` view. `reduce_grad` lets each rank read the slots holding its own experts' grads from every rank's reduce buffer (remote reads over NVLink), accumulate them into its local parameter grad, then zero its own consumed slots for the next microbatch.
+
+#### Sharing expert pools across layers
+
+`moonep.ExpertPools` allocates the pools once per process, and every MoE layer borrows them while it computes. Each layer keeps its own bf16 expert weights and fp32 grads in ordinary framework memory; the staging rows, prefetch slots and reduce slots exist once, not once per layer.
+
+```python
+from moonep import ExpertPools
+
+pools = ExpertPools(buffer, group, shapes={"gate": (Hi, H), "up": (Hi, H), "down": (H, Hi)})  # Hi = H'
+```
+
+Construction is collective over the Buffer's EP group. `shapes` maps gate/up/down to the per-expert `(out, in)` weight shape; both dims must be multiples of 128 (the kernels do not care what they mean). Per projection and dtype, each rank allocates one VMM chunk of `[2*epn, out, in]` elements (`epn` staging or local-grad rows, then `epn` slot rows) rounded up to the VMM granularity, and all `R` chunks are mapped back to back, so the padding is a gap between ranks:
+
+| Accessor | Shape, dtype | Memory |
+| --- | --- | --- |
+| `weights(n)` | `[2*epn, out, in]` bf16 | this rank's chunk: staging rows, then prefetch slots (the GEMM weight view) |
+| `staging(n)` | `[epn, out, in]` bf16 | `weights(n)[:epn]`; a layer copies its own experts here |
+| `prefetch_buffer(n)` | `[R, epn, out, in]` bf16 | every rank's slot rows, rank stride = padded chunk; `[rank]` is `weights(n)[epn:]` |
+| `grads(n)` | `[2*epn, out, in]` fp32 | local grad rows, then reduce slots (the dW view) |
+| `local_grads(n)` | `[epn, out, in]` fp32 | `grads(n)[:epn]` |
+| `reduce_buffer(n)` | `[R, epn, out, in]` fp32 | every rank's reduce slots; `[rank]` is `grads(n)[epn:]` |
+
+`push(plan)` runs `prefetch_weight` from the staging rows into the prefetch slots. `reduce(plan)` runs an inter-rank sync (`reduce_grad` has no entry barrier), then `reduce_grad` into `local_grads`, which zeroes the consumed slots. Both are collective and run on the current stream. `destroy()` releases the mappings; call it before destroying the process group. All views of one projection and dtype share one autograd version counter, so stash them on the autograd ctx rather than in `save_for_backward`.
+
+The pools hold one layer's experts at a time:
+
+- **Forward**: copy the layer's experts into `staging(n)`, dispatch, `push(plan)`, run the expert GEMMs on `weights(n)`, and save the plan.
+- **Backward**: before the layer's expert GEMMs, copy its experts into `staging(n)` again and `push` its saved plan, unless the pools still hold this layer's copies (no other layer pushed since its forward, e.g. the last layer). Every rank must make the same choice, because `push` is collective.
+- **Grads**: add dW into `grads(n)` and call `reduce(plan)` in the same layer's backward, before another layer writes the slots. `local_grads(n)` is shared as well: move it into the layer's own grad storage and zero it before the next layer's backward.
+- **Ordering**: `push` writes peers' slots without an entry barrier, so every rank must be done reading its slots for the previous layer; any dispatch or combine in between guarantees that. Two layers' expert computations cannot overlap.
 
 ### API walkthrough
 
@@ -155,7 +185,7 @@ output_sh, gathered_route_weights_sk, _ = buffer.combine(
 
 #### combine bwd
 
-Backward of combine: scatter the output grad back to VM group order by re-dispatching with the saved plan — planning is skipped and no prefetch is needed.
+Backward of combine: scatter the output grad back to VM group order by re-dispatching with the saved plan — planning is skipped, and with per-layer pools no prefetch is needed. With pools shared across layers, the slots may hold another layer's copies by now: re-stage this layer's experts and re-push its saved plan before its expert backward, unless the pools still hold its copies (see [Sharing expert pools across layers](#sharing-expert-pools-across-layers)).
 
 ```python
 grad_expert_output_nvsh, _, _, _ = buffer.dispatch(
@@ -202,6 +232,7 @@ torchrun --nproc_per_node=8 -m pytest tests/test_dispatch.py
 torchrun --nproc_per_node=8 -m pytest tests/test_combine.py
 torchrun --nproc_per_node=8 -m pytest tests/test_e2e.py
 torchrun --nproc_per_node=8 -m pytest tests/test_grad_reduce.py
+torchrun --nproc_per_node=8 -m pytest tests/test_expert_pools.py
 torchrun --nproc_per_node=8 -m pytest tests/test_prefetch.py
 ```
 
