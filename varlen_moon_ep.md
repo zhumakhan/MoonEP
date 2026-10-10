@@ -185,32 +185,41 @@ Grep for the identifiers below rather than relying on line numbers.
 
 ### `my_moon_ep.py` (training example)
 Ported from the old fork to the upstream API:
-- **Memory per projection.**
-  - A bf16 `[2*epn, in, out]` compute view: this rank's own-expert chunk and
-    its prefetch chunk, mapped back to back.
-  - The all-rank prefetch pool `[R, epn, ...]`, pushed into by
-    `prefetch_weight(local_*_weight=w[:epn], *_prefetch_buffer=pool)`.
-  - Plain fp32 `[epn, ...]` expert grads (the masters' `.grad`).
-  - The all-rank fp32 reduce pool, consumed by
-    `reduce_grad(local_*_grad=..., *_reduce_buffer=...)`.
-- **Weight grads.** `_ExpertGroupedMM` takes dW over `cu_seqlens[2*epn]`
-  directly and adds it into the fp32 grads and reduce slots. The old
-  `offs_live` compaction is not needed: the `[2*epn]` layout has no dead
-  groups.
+- **Memory.** One `MoonEPShared` (one `Buffer` and one `ExpertPools`) serves
+  every layer. The pools provide everything MoonEP maps: `weights(n)` (bf16
+  staging rows, then prefetch slots) and `grads(n)` (fp32 local-grad rows,
+  then reduce slots). Each layer's parameters are only its fp32 masters (the
+  router and the `[epn, ...]` experts) in ordinary memory.
+- **Sharing.** `MoonEPShared.stage_and_push(plan, masters)` remembers which
+  plan the pools hold. A layer's backward re-stages its experts and re-pushes
+  its saved plan only when another layer pushed since its forward, which is
+  every layer except the last.
+- **Weight grads.** `_ExpertFFN` runs the SwiGLU grouped GEMMs. Its forward
+  stages the masters as bf16 and calls `pools.push(plan)`. Its backward takes
+  dW over `cu_seqlens[2*epn]` into `grads(n)`, calls `pools.reduce(plan)`, and
+  returns the local rows as the masters' grads. These are ordinary autograd
+  grads: nothing aliases `.grad`, `zero_grad(set_to_none=True)` works, and no
+  separate reduce or weight-sync step remains. The router's grad is summed
+  over the EP group in its backward (`_AllReduceGrad`). The old `offs_live`
+  compaction is not needed: the `[2*epn]` layout has no dead groups.
 - **Varlen.** `forward(x, total_num_tokens=None)` takes `[s, H]` for any
   `s <= S`.
-- **Correctness check.** `main()` first checks a small layer against a dense
-  reference built from the all-gathered experts: output, dx, router grad and
-  expert grads, at `s = S`, `s = 131`, `s = 1` and per-rank `s`. It then times
-  the original training step.
+- **Correctness check.** `main()` first checks a small 3-layer stack on one
+  shared Buffer against a dense reference built from the all-gathered
+  experts. It compares output, dx, router grad and expert grads at `s = S`,
+  `s = 131`, `s = 1` and per-rank `s`. Each layer's reference gets that
+  layer's actual input and output grad, so bf16 differences do not compound
+  across layers. It then times a `NUM_LAYERS`-layer training step (default
+  2).
 - **Fixed defects of the old version:** a global RNG reseed in `__init__`, a
   `last_plan` / `_last_plan` mix-up, and a `reference_grads` that could not
   run.
-- **Emulated result on `slinky-0`.** All four checks passed: out <= 7e-3,
-  dx <= 1.5e-2, router grad <= 2e-7, expert grads <= 5.5e-3 relative. The
-  E=128 / K=16 / H=4096 / Hi=8192 / S=4096 step took 204.7 ms with AdamW. The
-  bf16 copies matched the masters and the router stayed identical across
-  ranks.
+- **Emulated result on `slinky-0`** (the earlier hand-mapped version, before
+  the `ExpertPools` rewrite; not re-run since). All four checks passed:
+  out <= 7e-3, dx <= 1.5e-2, router grad <= 2e-7, expert grads <= 5.5e-3
+  relative. The E=128 / K=16 / H=4096 / Hi=8192 / S=4096 step took 204.7 ms
+  with AdamW. The bf16 copies matched the masters and the router stayed
+  identical across ranks.
 
 ### `README.md`, `benchmarks/bench_comm.py`
 - The README notation, API bullets and code comments use `[s, ...]` /

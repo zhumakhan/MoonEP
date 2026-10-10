@@ -37,6 +37,15 @@ WARP_SYNC_TAG = 0x80000000
 BARRIER_TIMEOUT_CYCLES = 100 * 2_000_000_000
 
 
+def _leader_inc(tag, n):
+    """The leader's arrive increment ``tag - (n - 1)`` as Int32 bits, so the
+    n arrivals total ``tag``. Computed in Int64 and truncated: in Int32,
+    ``Int32(tag)`` is already -2**31, so a constant ``n`` makes the DSL's
+    constant fold overflow (same bits, but a TYPE_INT_LITERAL_OUT_OF_RANGE
+    warning on every compile)."""
+    return Int32(Int64(tag) - (n - 1))
+
+
 @dsl_user_op
 def clock64(*, loc=None, ip=None) -> Int64:
     """Corresponds to PTX ``mov.u64 ret, %clock64;``."""
@@ -262,7 +271,7 @@ def grid_sync(bar_ptr, nsm: Int32, tid: Int32):
         pid = cute.arch.block_idx()[0]
         inc = Int32(1)
         if pid == 0:
-            inc = Int32(GRID_SYNC_TAG) - (nsm - 1)
+            inc = _leader_inc(GRID_SYNC_TAG, nsm)
         old = atom_add_release_gpu(b0, inc)
         done = cutlass.Boolean(False)
         while not done:
@@ -373,7 +382,7 @@ def cross_warp_sync(
     # 2. Release arrive
     inc = Int32(1)
     if leader != 0:
-        inc = Int32(WARP_SYNC_TAG) - Int32(nparticipants - 1)   # self-reset: total increment = TAG
+        inc = _leader_inc(WARP_SYNC_TAG, nparticipants)   # self-reset: total increment = TAG
 
     # 3. ALL builder warps acquire-wait (not just bidx == 0)
     old = Int32(0)

@@ -1,6 +1,8 @@
 '''
 Run:
     torchrun --nproc-per-node=8 my_moon_ep.py
+
+NUM_LAYERS (default 2) sets the depth of the timed model.
 '''
 
 import math
@@ -11,16 +13,13 @@ from typing import Any
 import torch, torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-
-from moonep import Buffer
-from moonep._C import nvl_dist_alloc, nvl_dist_map, nvl_release_mem_handle, get_vmm_granularity
-from moonep.buffer import (
-    _all_gather_shareables, _exchange_ipc_fds, _use_fabric_for_group
-)
-from moonep.inter_rank_sync import launch_inter_rank_sync
+from transformer_engine.pytorch.optimizers import FusedAdam
+from moonep import Buffer, ExpertPools
 
 # torch 2.14 renamed ``all_gather_into_tensor`` to ``all_gather_single``.
 _all_gather_single = getattr(dist, "all_gather_single", None) or dist.all_gather_into_tensor
+
+_PROJECTIONS = ('gate', 'up', 'down')
 
 
 class _MoonEpDispatch(torch.autograd.Function):
@@ -102,115 +101,180 @@ class _MoonEPCombine(torch.autograd.Function):
         return grad_z, None, None
 
 
-class _ExpertGroupedMM(torch.autograd.Function):
-    """``torch._grouped_mm`` over the [2*epn] compute view whose weight grad
-    goes straight to fp32 storage.
+class MoonEPShared:
+    """One MoonEP Buffer and one ExpertPools for every MoE layer of a model.
 
-    Rows [0, epn) of the view are this rank's own experts and rows
-    [epn, 2*epn) its prefetch slots, and the planner's ``cu_seqlens`` covers
-    exactly those 2*epn groups. So dW is [2*epn, ...] and there are no dead
-    groups to skip; the old [E+B] pool needed a compacted ``offs`` for that.
-    A group with no tokens this step (an own expert nobody routed to, an
-    unused slot) costs no FLOPs and its dW is exactly zero. dW is added into
-    the fp32 targets (this rank's expert grads, then its reduce slots), so the
-    bf16 view never gets a ``.grad``.
-    """
-
-    @staticmethod
-    def forward(ctx, x, w, offs, fp32_targets):
-        # `w` rides on ctx rather than `save_for_backward`: prefetch_weight
-        # writes its slot rows in place outside autograd and it carries no grad
-        # of its own, so version tracking would only produce false positives.
-        ctx.save_for_backward(x)
-        ctx.w, ctx.offs, ctx.fp32_targets = w, offs, fp32_targets
-        return torch._grouped_mm(x, w, offs=offs)
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        x, = ctx.saved_tensors
-        grad_out = grad_out.contiguous()
-        grad_x = torch._grouped_mm(grad_out, ctx.w.transpose(-2, -1), offs=ctx.offs)
-        grad_w = torch._grouped_mm(x.t(), grad_out, offs=ctx.offs)
-        with torch.no_grad():
-            own, slots = ctx.fp32_targets
-            own.add_(grad_w[: own.shape[0]])
-            slots.add_(grad_w[own.shape[0]:])
-        return grad_x, None, None, None
-
-
-class MoonEPMoe(nn.Module):
-    """Top-K MoE with grouped GEMM experts, expert-parallel via MoonEP.
-
-    Mixed precision: fp32 masters (``parameters()``) for the optimizer, bf16
-    compute copies of the experts for the forward/backward, fp32 gating. The
-    expert masters' ``.grad`` alias the module's persistent fp32 grad storage,
-    so use ``moe.zero_grad()`` (never ``opt.zero_grad(set_to_none=True)``) and
-    call ``sync_compute_weights()`` after every ``opt.step()``.
-
-    Expert memory per projection (epn = E/R experts per rank):
-      - ``w_*`` [2*epn, in, out] bf16: one VA that maps this rank's own-expert
-        chunk and then its prefetch chunk, the layout ``cu_seqlens`` indexes;
-      - ``pf_*`` [R, epn, in, out] bf16: every rank's prefetch chunk;
-        ``prefetch_weight`` pushes each rank's experts into the slots of the
-        ranks that need them, so ``pf_*[rank]`` is the same memory as
-        ``w_*[epn:]``;
-      - ``g_*`` [epn, in, out] fp32: this rank's expert grads (the masters'
-        ``.grad``);
-      - ``rb_*`` [R, epn, in, out] fp32: every rank's reduce chunk. The dW of
-        the experts copied to this rank lands in ``rb_*[rank]``, and
-        ``reduce_grad`` sums every rank's slots into the owners' ``g_*``.
-    The pools belong to this one layer. A model with several layers can share
-    one prefetch pool and one reduce pool across layers, but must then
-    re-prefetch before each layer's backward.
+    Every layer dispatches and combines through the same Buffer: each dispatch
+    returns a fresh plan, so a layer's saved plan stays valid while later
+    layers run. Every layer also borrows the same pools while it computes, so
+    MoonEP's memory is paid once, not per layer. The pools hold one layer's
+    experts at a time; ``stage_and_push`` remembers whose and re-stages only
+    when that changed. Construction and ``destroy`` are collective over
+    ``group``.
     """
 
     def __init__(self, E, K, H, Hi, S, group=None, num_sms=32):
-        super().__init__()
-        self.E, self.K, self.H, self.Hi = E, K, H, Hi
+        self.E, self.K, self.H, self.Hi, self.S = E, K, H, Hi, S
         self.group = group
         self.rank = dist.get_rank(group)
         self.R = dist.get_world_size(group)
         self.epn = E // self.R
-        dev = torch.device('cuda', torch.cuda.current_device())
-
-        self.buffer = Buffer(S, H, K, E, self.R, num_sms=num_sms, group=group)
         self.lo, self.hi = self.rank * self.epn, (self.rank + 1) * self.epn
 
-        # ----- router: fp32, replicated (same seed on every rank, own generator)
-        # and used directly by the forward. Gating stays fp32 end to end: bf16
-        # logits flip top-k choices on near-ties, which destabilizes MoE
-        # training. Its grad is summed over the EP group in reduce_expert_grads().
+        self.buffer = Buffer(S, H, K, E, self.R, num_sms=num_sms, group=group)
+        # ExpertPools calls the per-expert dims (out, in); its kernels do not
+        # care, and the layers store [in, out] (y = x @ w).
+        self.pools = ExpertPools(
+            self.buffer, group, shapes={'gate': (H, Hi), 'up': (H, Hi), 'down': (Hi, H)}
+        )
+        self._pushed = None  # the plan whose copies the pools hold
+
+    def stage_and_push(self, plan, masters):
+        """Make the pools hold the experts of the layer call that made
+        ``plan``: cast its fp32 masters (gate, up, down) into the staging rows
+        and push the plan's copies into the prefetch slots. A no-op if no
+        other plan was pushed since (e.g. the last layer's backward).
+
+        Collective when it pushes. Every rank runs the layers in the same
+        order, so every rank makes the same choice. The push has no entry
+        barrier: the dispatch before every call here orders it after all
+        ranks' reads of the previous layer's slots.
+        """
+        if self._pushed is plan:
+            return
+        for name, w in zip(_PROJECTIONS, masters):
+            self.pools.staging(name).copy_(w)  # fp32 master -> bf16 rows [0, epn)
+        self.pools.push(plan)
+        self._pushed = plan
+
+    def destroy(self):
+        self._pushed = None
+        self.pools.destroy()
+        self.buffer.destroy()
+
+
+class _ExpertFFN(torch.autograd.Function):
+    """SwiGLU experts over the [2*epn] compute view, plus the weight side of
+    dispatch bwd.
+
+    Forward stages the layer's experts and pushes the plan's copies, then runs
+    the grouped GEMMs over ``pools.weights(n)``: rows [0, epn) are this rank's
+    experts and rows [epn, 2*epn) its prefetch slots, exactly the 2*epn groups
+    of ``cu_seqlens``. A group with no tokens this step costs no FLOPs and its
+    dW is zero.
+
+    Backward first makes the shared pools hold this layer's experts again
+    (later layers pushed theirs since), then writes dW of all 2*epn rows into
+    ``pools.grads(n)``, reduces the slot rows into their owners' local rows
+    (``pools.reduce``, collective) and returns this rank's rows as the
+    masters' grads. Those are ordinary autograd grads: nothing aliases
+    ``.grad``, and gradient accumulation just works. ``grads(n)`` is shared by
+    all layers: every backward overwrites all of its rows and clones the local
+    ones out before the next layer's backward. The combine and dispatch
+    between two layers' backwards order that overwrite after every rank's
+    reduce reads of the slots.
+    """
+
+    @staticmethod
+    def forward(ctx, h, offs, w_gate, w_up, w_down, ep, plan):
+        ep.stage_and_push(plan, (w_gate, w_up, w_down))
+        pools = ep.pools
+        gate = torch._grouped_mm(h, pools.weights('gate'), offs=offs)
+        up = torch._grouped_mm(h, pools.weights('up'), offs=offs)
+        y = torch._grouped_mm(F.silu(gate) * up, pools.weights('down'), offs=offs)
+        # The pool views stay off save_for_backward: push writes them outside
+        # autograd, and the staging copies of later layers bump the version
+        # counter that all views of one mapping share.
+        ctx.save_for_backward(h, offs, gate, up, w_gate, w_up, w_down)
+        ctx.ep, ctx.plan = ep, plan
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        h, offs, gate, up, *masters = ctx.saved_tensors
+        ep = ctx.ep
+        ep.stage_and_push(ctx.plan, masters)
+        pools = ep.pools
+        grad_y = grad_y.contiguous()
+
+        def gmm_t(a, name):  # a @ W[name]^T, per group
+            return torch._grouped_mm(a, pools.weights(name).transpose(-2, -1), offs=offs)
+
+        def dw(a, b, name):  # dW[name] = a^T @ b per group, into the fp32 pool
+            pools.grads(name).copy_(torch._grouped_mm(a.t(), b, offs=offs))
+
+        silu_gate = F.silu(gate)
+        dw(silu_gate * up, grad_y, 'down')
+        grad_act = gmm_t(grad_y, 'down')
+        grad_up = grad_act * silu_gate
+        grad_gate = torch.ops.aten.silu_backward(grad_act * up, gate)
+        dw(h, grad_gate, 'gate')
+        dw(h, grad_up, 'up')
+        grad_h = gmm_t(grad_gate, 'gate') + gmm_t(grad_up, 'up')
+
+        # The slot rows are other ranks' experts: add every rank's slot grads
+        # of this rank's experts into local_grads(n) = grads(n)[:epn].
+        pools.reduce(ctx.plan)
+        grad_ws = [pools.local_grads(name).clone() for name in _PROJECTIONS]
+        return grad_h, None, *grad_ws, None, None
+
+
+class _AllReduceGrad(torch.autograd.Function):
+    """Identity forward; backward sums the grad over the EP group.
+
+    The router is replicated across the EP group but every rank routes its
+    own tokens, so each rank's grad is a partial sum (the loss is a sum over
+    tokens, like the expert grads). Summing it in the backward gives every
+    replica the same grad, so they take the same optimizer step and stay
+    bit-identical.
+    """
+
+    @staticmethod
+    def forward(ctx, w, group):
+        ctx.group = group
+        return w.view_as(w)
+
+    @staticmethod
+    def backward(ctx, grad):
+        grad = grad.contiguous()
+        dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=ctx.group)
+        return grad, None
+
+
+class MoonEPMoe(nn.Module):
+    """Top-K MoE layer with grouped GEMM experts, expert-parallel via MoonEP.
+
+    The parameters are fp32 masters: the replicated router and this rank's
+    epn = E/R experts per projection. Their grads are ordinary autograd grads,
+    so any optimizer and ``zero_grad()`` work as usual. Each forward casts the
+    experts to bf16 for the GEMMs. Gating stays fp32.
+
+    MoonEP memory comes from ``ep``, shared by every layer: one Buffer and
+    one ExpertPools, per projection
+      - ``weights(n)`` [2*epn, in, out] bf16: the computing layer's experts,
+        then this rank's prefetch slots (the rows ``cu_seqlens`` indexes);
+      - ``grads(n)`` [2*epn, in, out] fp32: dW of the same rows.
+    Layers run one at a time (two layers' expert computations cannot overlap),
+    and every rank runs them in the same order.
+    """
+
+    def __init__(self, ep: MoonEPShared, seed=0):
+        super().__init__()
+        self.ep = ep
+        E, H, Hi, epn = ep.E, ep.H, ep.Hi, ep.epn
+        dev = torch.device('cuda', torch.cuda.current_device())
+
+        # ----- router: fp32, replicated (same seed on every rank, own
+        # generator). Gating stays fp32 end to end: bf16 logits flip top-k
+        # choices on near-ties, which destabilizes MoE training.
         router_w = torch.empty(E, H, dtype=torch.float32)
         nn.init.kaiming_uniform_(  # nn.Linear's default init
-            router_w, a=math.sqrt(5), generator=torch.Generator().manual_seed(0)
+            router_w, a=math.sqrt(5), generator=torch.Generator().manual_seed(seed)
         )
         self.router_w = nn.Parameter(router_w.to(dev))
 
-        # ----- experts: bf16 compute views + prefetch pools, fp32 grads +
-        # reduce pools (see the class docstring). Buffers, not Parameters: the
-        # optimizer must never see them. Every rank allocates and maps in the
-        # same order (the handle exchange is collective).
-        self._keepalives = []
-        self._use_fabric = _use_fabric_for_group(group)
-        shapes = (('gate', (self.epn, H, Hi)),
-                  ('up', (self.epn, H, Hi)),
-                  ('down', (self.epn, Hi, H)))
-        for name, shape in shapes:
-            view, pool = self._weight_buffers(shape)
-            self.register_buffer(f'w_{name}', view, persistent=False)
-            setattr(self, f'pf_{name}', pool)
-        for name, shape in shapes:
-            setattr(self, f'g_{name}', torch.zeros(shape, dtype=torch.float32, device=dev))
-            rb = self._reduce_pool(shape)
-            # cuMemCreate memory is not zero-filled, and the backward adds into
-            # this rank's slots; reduce_grad clears the slots it consumes.
-            rb[self.rank].zero_()
-            setattr(self, f'rb_{name}', rb)
-
-        # ---- experts, fp32 masters of this rank's own rows: plain local
-        # tensors. Their .grad permanently alias g_*, so after
-        # reduce_expert_grads() they hold the reduced grad.
-        g = torch.Generator(device=dev).manual_seed(100 + self.rank)
+        # ----- experts: fp32 masters of this rank's own rows
+        g = torch.Generator(device=dev).manual_seed(100 + seed * ep.R + ep.rank)
 
         def master(*shape):
             return nn.Parameter(
@@ -218,121 +282,18 @@ class MoonEPMoe(nn.Module):
                 .normal_(0.0, 0.02, generator=g)
             )
 
-        self.wm_gate = master(self.epn, H, Hi)
-        self.wm_up = master(self.epn, H, Hi)
-        self.wm_down = master(self.epn, Hi, H)
-        self.wm_gate.grad = self.g_gate
-        self.wm_up.grad = self.g_up
-        self.wm_down.grad = self.g_down
-        self.sync_compute_weights()  # bf16 copies of the own expert rows
-
-        self._last_plan = None
-        torch.cuda.synchronize()
-        dist.barrier(group=group)
-
-    # ---- VMM mapping helpers --------------------------------------------
-    # A "share item" is what nvl_dist_map imports for one chunk: an int fd on
-    # the same node, or a uint8[64] CPU fabric handle. Every rank calls these
-    # in the same order (the fd exchange is collective). Received fds are dups
-    # owned by this process and are closed once the mappings exist.
-
-    def _alloc_chunk(self, chunk_shape, dtype):
-        """Allocate one VMM chunk on this GPU; return its exported shareable."""
-        nbytes = dtype.itemsize
-        for d in chunk_shape:
-            nbytes *= d
-        gran = get_vmm_granularity()
-        assert nbytes % gran == 0, (
-            f"chunk {tuple(chunk_shape)} {dtype} = {nbytes} B must be a "
-            f"multiple of VMM granularity {gran}"
-        )
-        ka, share, owned = nvl_dist_alloc(
-            shape=list(chunk_shape), dtype=dtype, use_fabric=self._use_fabric
-        )
-        self._keepalives.append(ka)
-        nvl_release_mem_handle(owned)
-        return share
-
-    def _local_item(self, share):
-        return share.cpu().view(-1) if self._use_fabric else int(share.item())
-
-    def _gathered_items(self, share):
-        """Every rank's item for the chunk `share` describes on that rank."""
-        if self._use_fabric:
-            handles = _all_gather_shareables(share, self.group)  # uint8 [R, 64] CPU
-            return [handles[r] for r in range(self.R)]
-        fds = _exchange_ipc_fds(int(share.item()), list(range(self.R)),
-                                self.rank, self.R, self.group)
-        return [fds[r] for r in range(self.R)]
-
-    def _map_items(self, chunk_shape, dtype, items):
-        """Map the chunks in `items` back to back into one contiguous VA."""
-        if self._use_fabric:
-            shareables = torch.stack(items)
-        else:
-            shareables = torch.tensor(items, dtype=torch.int64)
-        return nvl_dist_map(
-            chunk_shape=list(chunk_shape), dtype=dtype, shareables=shareables,
-            local_rank=self.rank, world_size=len(items), use_fabric=self._use_fabric,
-        )
-
-    def _close_items(self, items):
-        if not self._use_fabric:
-            for fd in items:
-                os.close(fd)
-
-    def _weight_buffers(self, chunk_shape):
-        """bf16 (compute view [2*epn, ...], prefetch pool [R, epn, ...])."""
-        w_share = self._alloc_chunk(chunk_shape, torch.bfloat16)  # own experts
-        p_share = self._alloc_chunk(chunk_shape, torch.bfloat16)  # prefetch slots
-        p_items = self._gathered_items(p_share)
-        own = [self._local_item(w_share), self._local_item(p_share)]
-        try:
-            view = self._map_items(chunk_shape, torch.bfloat16, own)
-            pool = self._map_items(chunk_shape, torch.bfloat16, p_items)
-        finally:
-            self._close_items(p_items + own)
-        return view, pool.view(self.R, *chunk_shape)
-
-    def _reduce_pool(self, chunk_shape):
-        """fp32 [R, epn, ...]: every rank's reduce chunk."""
-        r_share = self._alloc_chunk(chunk_shape, torch.float32)
-        r_items = self._gathered_items(r_share)
-        try:
-            pool = self._map_items(chunk_shape, torch.float32, r_items)
-        finally:
-            self._close_items(r_items + [self._local_item(r_share)])
-        return pool.view(self.R, *chunk_shape)
-
-    def zero_grad(self, set_to_none: bool = True):
-        """Zero the expert masters' persistent fp32 grads in place (their
-        .grad alias them, so `set_to_none` is ignored for them) and drop the
-        router's ordinary autograd grad. The bf16 compute views never get a
-        .grad; reduce_grad clears the reduce slots it consumes.
-        """
-        with torch.no_grad():
-            for g in (self.g_gate, self.g_up, self.g_down):
-                g.zero_()
-        self.router_w.grad = None
-
-    @torch.no_grad()
-    def sync_compute_weights(self):
-        """fp32 expert masters -> rows [0, epn) of the bf16 compute views (the
-        router has no bf16 copy). Call after every optimizer step. Only this
-        rank reads those rows: its next prefetch_weight pushes them to the
-        ranks that need copies, so stream order is the only ordering needed.
-        """
-        for w16, wm in ((self.w_gate, self.wm_gate),
-                        (self.w_up, self.wm_up),
-                        (self.w_down, self.wm_down)):
-            w16[: self.epn].copy_(wm)
+        self.w_gate = master(epn, H, Hi)
+        self.w_up = master(epn, H, Hi)
+        self.w_down = master(epn, Hi, H)
 
     def route(self, x):
-        logits = F.linear(x.float(), self.router_w)  # fp32 gating: GEMM, top-k and softmax
-        weights, idx = torch.topk(logits, k=self.K, dim=-1)
+        E, K = self.ep.E, self.ep.K
+        router_w = _AllReduceGrad.apply(self.router_w, self.ep.group)
+        logits = F.linear(x.float(), router_w)  # fp32 gating: GEMM, top-k and softmax
+        weights, idx = torch.topk(logits, k=K, dim=-1)
         weights = F.softmax(weights, dim=-1)
         topk = idx.to(torch.int32)
-        tpe = torch.bincount(topk.flatten(), minlength=self.E).to(torch.int32)
+        tpe = torch.bincount(topk.flatten(), minlength=E).to(torch.int32)
         return weights.contiguous(), topk.contiguous(), tpe
 
     def forward(self, x, total_num_tokens=None):
@@ -341,44 +302,27 @@ class MoonEPMoe(nn.Module):
         Ranks may pass different s when every rank passes ``total_num_tokens``
         (the sum of s over the EP group).
         """
+        ep = self.ep
         weights, topk, tpe = self.route(x)
 
         # dispatch: scatter tokens to their experts' home/copy ranks over
         # NVLink (autograd-aware: backward is combine with the saved plan)
         holder = {}
         h_nvs, w_nvs, cu_seqlens = _MoonEpDispatch.apply(
-            x, weights, topk, tpe, self.buffer, holder, total_num_tokens
+            x, weights, topk, tpe, ep.buffer, holder, total_num_tokens
         )
         plan = holder['plan']
-        self._last_plan = plan
-        # push this rank's experts into the prefetch slots of the ranks that
-        # copy them. Collective: every rank calls it, and when it returns this
-        # rank's own slots (w_*[epn:]) are filled. Raw kernel writes outside
-        # autograd; the slots must keep this step's experts until the backward.
-        epn = self.epn
-        self.buffer.prefetch_weight(
-            plan=plan,
-            local_gate_weight=self.w_gate[:epn],
-            local_up_weight=self.w_up[:epn],
-            local_down_weight=self.w_down[:epn],
-            gate_prefetch_buffer=self.pf_gate,
-            up_prefetch_buffer=self.pf_up,
-            down_prefetch_buffer=self.pf_down,
-        )
 
-        # grouped GEMM straight over the dispatched layout: cu_seqlens [2*epn]
-        # is already _grouped_mm's offs format, groups [0, epn) are this rank's
-        # experts and groups [epn, 2*epn) its copies. Padding rows are
-        # zero-filled by dispatch, so their FFN output is exactly zero. No host
-        # sync: _grouped_mm only touches rows inside the cu_seqlens groups, and
+        # expert FFN straight over the dispatched layout: cu_seqlens [2*epn] is
+        # already _grouped_mm's offs format. Padding rows are zero-filled by
+        # dispatch, so their FFN output is exactly zero. No host sync:
+        # _grouped_mm only touches rows inside the cu_seqlens groups, and
         # cu_seqlens[-1] <= plan.nvs_s keeps offs inside the [plan.nvs_s, H]
         # view. Rows past cu_seqlens[-1] are left uninitialized; no dst slot
         # references them, so nothing reads them.
-        gmm = _ExpertGroupedMM.apply
-        r = self.rank
-        gate = gmm(h_nvs, self.w_gate, cu_seqlens, (self.g_gate, self.rb_gate[r]))
-        up = gmm(h_nvs, self.w_up, cu_seqlens, (self.g_up, self.rb_up[r]))
-        y = gmm(F.silu(gate) * up, self.w_down, cu_seqlens, (self.g_down, self.rb_down[r]))
+        y = _ExpertFFN.apply(
+            h_nvs, cu_seqlens, self.w_gate, self.w_up, self.w_down, ep, plan
+        )
 
         # scale each slot by its routing weight. Padding and tail slots carry
         # stale weight values (never written for this step); nan_to_num keeps
@@ -388,82 +332,35 @@ class MoonEPMoe(nn.Module):
 
         # combine: gather every token's K expert outputs back to its source
         # rank and sum -> [s, H] (backward: re-dispatch with the saved plan)
-        return _MoonEPCombine.apply(z, self.buffer, plan)
-
-    def reduce_expert_grads(self):
-        """dispatch bwd, weight side: sum the copied experts' grads (this
-        rank's reduce slots rb_*[rank]) into their owners' g_* with
-        Buffer.reduce_grad, and sum the replicated router's grad over the EP
-        group.
-
-        Call once per micro-batch, after backward and before any DP grad
-        reduction / optimizer step: the next forward's plan reassigns the
-        slots. The router all-reduce assumes one micro-batch per step; with
-        gradient accumulation, sum the router grad once per step instead.
-        Returns the fp32 [epn, ...] grads (gate, up, down).
-        """
-        assert self._last_plan is not None, "reduce_expert_grads needs a prior forward"
-        assert self.router_w.grad is not None, "call backward() before reduce_expert_grads()"
-        # The router is replicated across the EP group but every rank routed a
-        # different token batch: sum the local grads (the loss is a sum over
-        # tokens, matching the summed expert grads) so every replica takes the
-        # same optimizer step and stays bit-identical.
-        dist.all_reduce(self.router_w.grad, op=dist.ReduceOp.SUM, group=self.group)
-        # reduce_grad has no entry barrier: every rank's backward must have
-        # finished writing its reduce slots before any rank reads them.
-        # Device-side sync, no host round trip.
-        launch_inter_rank_sync(self.buffer._require_ctx())
-        self.buffer.reduce_grad(
-            plan=self._last_plan,
-            local_gate_grad=self.g_gate,
-            local_up_grad=self.g_up,
-            local_down_grad=self.g_down,
-            gate_reduce_buffer=self.rb_gate,
-            up_reduce_buffer=self.rb_up,
-            down_reduce_buffer=self.rb_down,
-        )
-        return self.g_gate, self.g_up, self.g_down
-
-    def destroy(self):
-        self.buffer.destroy()
+        return _MoonEPCombine.apply(z, ep.buffer, plan)
 
 
-def check_against_dense_reference(moe, s, total_num_tokens=None, seed=0, tol=3e-2):
-    """One fwd + bwd + reduce_expert_grads() at s tokens on this rank,
-    compared with a dense per-expert reference that runs the same math on
-    every rank's experts (all-gathered, so the check needs no MoonEP memory).
-
-    Returns the worst relative error (max abs error / max abs reference) over
-    the EP group of (output, dx, router grad, expert grads) and whether all are
-    within ``tol``. Both sides round to bf16 at the same points, but the
-    reference accumulates each token's K slot grads in bf16, so dx differs by
-    up to ~1-2% at bf16.
+def _dense_reference_errors(layer, x_in, out):
+    """Relative errors (max abs error / max abs reference) of one layer's
+    (output, dx, router grad, expert grads) against a dense per-expert
+    reference fed the same input ``x_in`` and output grad ``out.grad``. The
+    reference runs the same math on every rank's experts (all-gathered, so it
+    needs no MoonEP memory). Collective over the EP group.
     """
-    dev = torch.device('cuda', torch.cuda.current_device())
-    gen = torch.Generator(device=dev).manual_seed(1000 * seed + moe.rank)
-    x = torch.randn(s, moe.H, dtype=torch.bfloat16, device=dev, generator=gen).requires_grad_()
-    gout = torch.randn(s, moe.H, dtype=torch.float32, device=dev, generator=gen)
-
-    moe.zero_grad()
-    out = moe(x, total_num_tokens=total_num_tokens)
-    (out.float() * gout).sum().backward()
-    g_gate, g_up, g_down = moe.reduce_expert_grads()
+    ep = layer.ep
+    s, dev = x_in.shape[0], x_in.device
 
     # dense reference: same routing (fp32 router), same rounding points
     wr = {}
-    for name, w16 in (('gate', moe.w_gate), ('up', moe.w_up), ('down', moe.w_down)):
-        full = torch.empty(moe.E, *w16.shape[1:], dtype=w16.dtype, device=dev)
-        _all_gather_single(full, w16[: moe.epn].contiguous(), group=moe.group)
+    for name in _PROJECTIONS:
+        w = getattr(layer, f'w_{name}').detach().to(torch.bfloat16)
+        full = torch.empty(ep.E, *w.shape[1:], dtype=w.dtype, device=dev)
+        _all_gather_single(full, w, group=ep.group)
         wr[name] = full.requires_grad_()
-    xr = x.detach().clone().requires_grad_()
-    rw = moe.router_w.detach().clone().requires_grad_()
+    xr = x_in.detach().clone().requires_grad_()
+    rw = layer.router_w.detach().clone().requires_grad_()
     logits = F.linear(xr.float(), rw)
-    w, idx = torch.topk(logits, k=moe.K, dim=-1)
+    w, idx = torch.topk(logits, k=ep.K, dim=-1)
     w = F.softmax(w, dim=-1)
     flat_w, flat_e = w.flatten(), idx.flatten()
-    flat_t = torch.arange(s, device=dev).repeat_interleave(moe.K)
-    ref = torch.zeros(s, moe.H, dtype=torch.float32, device=dev)
-    for e in range(moe.E):
+    flat_t = torch.arange(s, device=dev).repeat_interleave(ep.K)
+    ref = torch.zeros(s, ep.H, dtype=torch.float32, device=dev)
+    for e in range(ep.E):
         sel = flat_e == e
         if not bool(sel.any()):
             continue
@@ -472,25 +369,62 @@ def check_against_dense_reference(moe, s, total_num_tokens=None, seed=0, tol=3e-
         z = (y.float() * flat_w[sel, None]).to(torch.bfloat16)
         ref = ref.index_add(0, t, z.float())
     ref = ref.to(torch.bfloat16)
-    (ref.float() * gout).sum().backward()
+    ref.backward(out.grad)
     # sum every rank's contributions in fp32, like reduce_grad does
-    ref_grads = [rw.grad] + [wr[n].grad.float() for n in ('gate', 'up', 'down')]
+    ref_grads = [rw.grad] + [wr[n].grad.float() for n in _PROJECTIONS]
     for t in ref_grads:
-        dist.all_reduce(t, group=moe.group)
+        dist.all_reduce(t, group=ep.group)
     ref_router, ref_gate, ref_up, ref_down = ref_grads
 
     def rel(a, b):
         return ((a.float() - b.float()).abs().max() / b.float().abs().max().clamp(min=1e-6)).item()
 
-    lo, hi = moe.lo, moe.hi
-    errs = torch.tensor([
+    lo, hi = ep.lo, ep.hi
+    return torch.tensor([
         rel(out, ref),
-        rel(x.grad, xr.grad),
-        rel(moe.router_w.grad, ref_router),
-        max(rel(g_gate, ref_gate[lo:hi]), rel(g_up, ref_up[lo:hi]),
-            rel(g_down, ref_down[lo:hi])),
+        rel(x_in.grad, xr.grad),
+        rel(layer.router_w.grad, ref_router),
+        max(rel(layer.w_gate.grad, ref_gate[lo:hi]), rel(layer.w_up.grad, ref_up[lo:hi]),
+            rel(layer.w_down.grad, ref_down[lo:hi])),
     ], device=dev)
-    dist.all_reduce(errs, op=dist.ReduceOp.MAX, group=moe.group)
+
+
+def check_against_dense_reference(layers, s, total_num_tokens=None, seed=0, tol=3e-2):
+    """One fwd + bwd at s tokens on this rank through ``layers`` (a stack
+    sharing one MoonEPShared), then every layer against a dense reference.
+
+    Each reference gets its layer's actual input and output grad, so bf16
+    differences do not compound across layers (they could flip a later
+    layer's top-k on near-ties). Every layer but the last re-stages and
+    re-pushes in its backward, so a wrong expert or slot shows up in its dx
+    and expert grads.
+
+    Returns the worst relative error over the layers and the EP group of
+    (output, dx, router grad, expert grads), and whether all are within
+    ``tol``. Both sides round to bf16 at the same points, but the reference
+    accumulates each token's K slot grads in bf16, so dx differs by up to
+    ~1-2% at bf16.
+    """
+    ep = layers[0].ep
+    dev = torch.device('cuda', torch.cuda.current_device())
+    gen = torch.Generator(device=dev).manual_seed(1000 * seed + ep.rank)
+    x = torch.randn(s, ep.H, dtype=torch.bfloat16, device=dev, generator=gen).requires_grad_()
+    gout = torch.randn(s, ep.H, dtype=torch.float32, device=dev, generator=gen)
+
+    layers.zero_grad()
+    ins, outs = [], []
+    h = x
+    for layer in layers:
+        ins.append(h)
+        h = layer(h, total_num_tokens=total_num_tokens)
+        h.retain_grad()  # the next layer's dx and this layer's output grad
+        outs.append(h)
+    (h.float() * gout).sum().backward()
+
+    errs = torch.zeros(4, device=dev)
+    for layer, x_in, out in zip(layers, ins, outs):
+        errs = torch.maximum(errs, _dense_reference_errors(layer, x_in, out))
+    dist.all_reduce(errs, op=dist.ReduceOp.MAX, group=ep.group)
     errs = errs.tolist()
     return errs, all(e <= tol for e in errs)
 
@@ -503,13 +437,16 @@ def main():
     torch.cuda.set_device(local_rank)
     dev = f'cuda:{local_rank}'
 
-    # ---- correctness: a small layer against a dense reference, at the full
-    # capacity, partial s and per-rank s. Half the router rows are zeroed so
-    # the routing is skewed and the prefetch / grad-reduce paths run.
+    # ---- correctness: a small 3-layer stack on one shared Buffer and pools
+    # against a dense reference, at the full capacity, partial s and per-rank
+    # s. Half of every router's rows are zeroed so the routing is skewed and
+    # the prefetch / grad-reduce paths run.
     S_chk = 512
-    chk = MoonEPMoe(E=8 * R, K=8, H=1024, Hi=1024, S=S_chk)
+    ep_chk = MoonEPShared(E=8 * R, K=8, H=1024, Hi=1024, S=S_chk)
+    chk = nn.ModuleList(MoonEPMoe(ep_chk, seed=l) for l in range(3))
     with torch.no_grad():
-        chk.router_w[: chk.E // 2].zero_()
+        for layer in chk:
+            layer.router_w[: ep_chk.E // 2].zero_()
     per_rank = [S_chk, 37, 1, 300, 64, 5, 128, 256]
     s_r = per_rank[rank % len(per_rank)]
     total = sum(per_rank[r % len(per_rank)] for r in range(R))
@@ -517,37 +454,44 @@ def main():
                           (f'per-rank s (total={total})', s_r, total)):
         errs, ok = check_against_dense_reference(chk, s, tot, seed=s)
         if rank == 0:
-            print(f"[check {label}] {'PASS' if ok else 'FAIL'} max rel err: out {errs[0]:.1e}, "
-                  f"dx {errs[1]:.1e}, router grad {errs[2]:.1e}, expert grads {errs[3]:.1e}",
-                  flush=True)
-    chk.destroy()
+            print(f"[check {len(chk)} layers, {label}] {'PASS' if ok else 'FAIL'} max rel err: "
+                  f"out {errs[0]:.1e}, dx {errs[1]:.1e}, router grad {errs[2]:.1e}, "
+                  f"expert grads {errs[3]:.1e}", flush=True)
     del chk
+    ep_chk.destroy()
 
-    # ---- training-step timing
+    # ---- training-step timing: NUM_LAYERS layers on one shared Buffer and pools
     S, K, E, H, Hi = 1024 * 4, 16, 128, 4096, 4096 * 2
-    moe = MoonEPMoe(E, K, H, Hi, S)
+    num_layers = int(os.getenv('NUM_LAYERS', '2'))
+    ep = MoonEPShared(E, K, H, Hi, S)
+    model = nn.ModuleList(MoonEPMoe(ep, seed=l) for l in range(num_layers))
 
-    # skew the routing by zeroing part of the (fp32, replicated) router
+    # skew the routing by zeroing part of the (fp32, replicated) routers
     with torch.no_grad():
-        moe.router_w[: E // 2].zero_()
+        for layer in model:
+            layer.router_w[: E // 2].zero_()
 
-    # AdamW over the fp32 masters only: parameters() excludes the bf16 compute
-    # copies. The masters' .grad alias MoonEPMoe's persistent fp32 grad
-    # storage, so grads are cleared with moe.zero_grad(), never opt.zero_grad().
-    opt = torch.optim.AdamW(moe.parameters(), lr=1e-4, weight_decay=0.0)
+    # opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.0)
+    opt = FusedAdam(model.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=0.9, eps=1e-8)
+    
 
     g = torch.Generator(device=dev).manual_seed(42 + rank)
     x = torch.randn(S, H, dtype=torch.bfloat16, device=dev, generator=g).requires_grad_(True)
     gout = torch.randn(S, H, dtype=torch.float32, device=dev, generator=g)
-
+    
+    ep_cpu_group = dist.new_group(dist.get_process_group_ranks(dist.group.WORLD), backend='gloo')
     def train_step():
-        moe.zero_grad()
+        opt.zero_grad()
         x.grad = None
-        out = moe(x)
-        (out.float() * gout).sum().backward()
-        moe.reduce_expert_grads()
+        h = x
+        seq_len = torch.tensor([h.size(0)])
+        dist.all_reduce(seq_len, op=dist.ReduceOp.SUM, group=ep_cpu_group)
+        total_num_tokens = int(seq_len)
+        
+        for layer in model:
+            h = layer(h, total_num_tokens=total_num_tokens)
+        (h.float() * gout).sum().backward()
         opt.step()
-        moe.sync_compute_weights()
 
     for _ in range(10):
         train_step()
@@ -564,25 +508,21 @@ def main():
     ms = (time_end - time_start) / n_iters * 1e3
     t = torch.tensor([ms], device=dev)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    print(f"[rank {rank}] {ms:.3f} ms/step fwd+bwd+reduce+AdamW (slowest rank: {t.item():.3f} ms)")
+    print(f"[rank {rank}] {ms:.3f} ms/step fwd+bwd+AdamW, {num_layers} layers "
+          f"(slowest rank: {t.item():.3f} ms)")
 
-    # after the last refresh the bf16 compute copies must be exactly the cast
-    # masters, and the replicated router must be bit-identical on every rank
+    # every replicated router must be bit-identical on every rank
     with torch.no_grad():
-        consistent = all(
-            torch.equal(w16[: moe.epn], wm.to(torch.bfloat16))
-            for w16, wm in ((moe.w_gate, moe.wm_gate), (moe.w_up, moe.wm_up),
-                            (moe.w_down, moe.wm_down))
-        )
-        router_ref = moe.router_w.detach().clone()
-        dist.broadcast(router_ref, src=0)
-        router_in_sync = torch.equal(moe.router_w, router_ref)
+        router_in_sync = True
+        for layer in model:
+            router_ref = layer.router_w.detach().clone()
+            dist.broadcast(router_ref, src=0)
+            router_in_sync &= torch.equal(layer.router_w, router_ref)
 
-    print(f"[rank {rank}] bf16 compute copies == cast fp32 masters: {consistent}; "
-          f"router identical across ranks: {router_in_sync}")
+    print(f"[rank {rank}] routers identical across ranks: {router_in_sync}")
     torch.cuda.synchronize()
     dist.barrier()
-    moe.destroy()
+    ep.destroy()
     dist.destroy_process_group()
 
 
